@@ -1,0 +1,15 @@
+[package]
+name = "conductor-cli"
+description = "Proste CLI do sterowania conductord (UI fazy 0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "conductor"
+path = "src/main.rs"
+
+[dependencies]
+conductor-proto = { path = "../conductor-proto" }
