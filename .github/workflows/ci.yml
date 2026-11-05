@@ -1,0 +1,54 @@
+# UWAGA: GitHub Actions to punkt startowy. Docelowo CI dziala na wewnetrznych runnerach
+# (self-hosted, w sieci firmowej, bez dostepu do internetu; zaleznosci z mirrora/vendoru,
+# patrz docs/build/supply-chain.md). Cala logika jest w ci/*.sh, wiec ten sam zestaw
+# da sie uruchomic na GitLab CI, Jenkinsie lub lokalnie. Ten plik tylko je wywoluje.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  REQUIRE_TOOLS: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Zalecane: przypiac akcje do pelnego SHA commita (tu tagi dla czytelnosci punktu startowego).
+      - uses: actions/checkout@v4
+      - name: Toolchain (z rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Narzedzia (cargo-deny, cargo-audit)
+        run: cargo install --locked cargo-deny cargo-audit
+      - name: fmt
+        run: ci/check.sh fmt
+      - name: clippy
+        run: ci/check.sh clippy
+      - name: test
+        run: ci/check.sh test
+      - name: cargo-deny
+        run: ci/check.sh deny
+      - name: cargo-audit
+        run: ci/check.sh audit
+
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (z rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+      - name: SBOM CycloneDX
+        run: ci/sbom.sh target/sbom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: target/sbom/
+          if-no-files-found: error
