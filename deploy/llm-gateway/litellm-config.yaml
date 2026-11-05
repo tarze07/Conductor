@@ -1,0 +1,115 @@
+# LiteLLM proxy - konfiguracja testowego LLM Gateway Conductora (issue #13).
+#
+# Zasady:
+#  - tylko aliasy rol (conductor-*) wskazujace na backendy on-prem; brak wildcardow
+#    i brak zewnetrznych providerow (siec kontenera i tak nie ma wyjscia na internet),
+#  - adresy backendow i nazwy modeli z env (patrz docker-compose.yml), dzieki czemu ta sama
+#    konfiguracja dziala z Ollama (profil cpu) i vLLM (profil gpu),
+#  - zadnych zewnetrznych callbackow logowania; logi JSON na stdout, a z Postgresem
+#    takze logi zuzycia/zapytan w bazie,
+#  - API zgodne z OpenAI (/v1/chat/completions, /v1/responses, /v1/embeddings) oraz
+#    z Anthropic (/v1/messages) - oba obslugiwane przez LiteLLM proxy.
+#
+# Koszt on-prem to 0 USD, wiec budzety liczymy w "kredytach": cena za token ponizej jest
+# umowna (1 kredyt = 1 USD w polu spend). Dzieki temu max_budget dziala jak kwota tokenowa.
+
+model_list:
+  # Szybkie, tanie zadania: autouzupelnianie, podsumowania, klasyfikacja, nazwy commitow.
+  - model_name: conductor-fast
+    litellm_params:
+      model: os.environ/FAST_MODEL          # hosted_vllm/fast (vLLM) lub hosted_vllm/qwen2.5-coder:1.5b (Ollama)
+      api_base: os.environ/FAST_API_BASE
+      api_key: os.environ/BACKEND_API_KEY
+      input_cost_per_token: 0.0000002
+      output_cost_per_token: 0.0000006
+      rpm: 600
+      tpm: 600000
+    model_info: { role: fast }
+
+  # Implementacja: glowny model kodujacy.
+  - model_name: conductor-coder
+    litellm_params:
+      model: os.environ/CODER_MODEL
+      api_base: os.environ/CODER_API_BASE
+      api_key: os.environ/BACKEND_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000003
+      rpm: 300
+      tpm: 400000
+    model_info: { role: coder }
+
+  # Planowanie / dekompozycja zadan (najwiekszy dostepny model, rzadziej wywolywany).
+  - model_name: conductor-planner
+    litellm_params:
+      model: os.environ/PLANNER_MODEL
+      api_base: os.environ/PLANNER_API_BASE
+      api_key: os.environ/BACKEND_API_KEY
+      input_cost_per_token: 0.000002
+      output_cost_per_token: 0.000006
+      rpm: 120
+      tpm: 300000
+    model_info: { role: planner }
+
+  # Recenzja diffow i testow. W pilotazu domyslnie ten sam backend co coder,
+  # ale jako osobny alias, zeby mozna go pozniej podmienic (niezalezna ocena).
+  - model_name: conductor-reviewer
+    litellm_params:
+      model: os.environ/REVIEWER_MODEL
+      api_base: os.environ/REVIEWER_API_BASE
+      api_key: os.environ/BACKEND_API_KEY
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000003
+      rpm: 300
+      tpm: 400000
+    model_info: { role: reviewer }
+
+litellm_settings:
+  # Brak zewnetrznych callbackow (Langfuse, Datadog, Helicone, Sentry itd.).
+  callbacks: []
+  success_callback: []
+  failure_callback: []
+  service_callback: []
+  json_logs: true                 # strukturalne logi na stdout
+  turn_off_message_logging: false # tresc zapytan ma byc w logach wewnetrznych (audyt); patrz docs o DLP i retencji
+  drop_params: true               # ignoruj parametry nieznane backendowi zamiast zwracac blad
+  request_timeout: 600
+  num_retries: 1
+  # Globalny limit awaryjny (kredyty/okres) dla calego gateway'a; budzety kluczy i zespolow
+  # ustawia sie przez API (wymaga Postgresa), patrz docs/llm-gateway.md.
+  max_budget: 100000
+  budget_duration: 30d
+  # Domyslne parametry kazdego nowo wygenerowanego klucza wirtualnego.
+  default_key_generate_params:
+    max_budget: 50
+    budget_duration: 30d
+    tpm_limit: 200000
+    rpm_limit: 120
+    models: [conductor-fast, conductor-coder, conductor-planner, conductor-reviewer]
+  # Gorne ograniczenia, ktorych nie da sie przekroczyc przy tworzeniu klucza.
+  upperbound_key_generate_params:
+    max_budget: 500
+    budget_duration: 30d
+    tpm_limit: 1000000
+    rpm_limit: 600
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 1
+  timeout: 600
+  # Fallback tylko miedzy aliasami lokalnymi (nigdy do zewnetrznego providera).
+  fallbacks:
+    - conductor-planner: [conductor-coder]
+    - conductor-reviewer: [conductor-coder]
+    - conductor-coder: [conductor-fast]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # klucz administratora; tylko do zarzadzania kluczami
+  # database_url jest brany ze zmiennej DATABASE_URL (profil db). Bez bazy nie ma kluczy
+  # wirtualnych ani budzetow zespolow.
+  allow_requests_on_db_unavailable: false     # brak bazy = brak obslugi (fail closed)
+  store_prompts_in_spend_logs: true           # tresc zapytan/odpowiedzi w tabeli logow (Postgres) - audyt
+  maximum_spend_logs_retention_period: 30d    # retencja logow w bazie
+  disable_spend_logs: false
+  disable_reset_budget: false
+  # Brak ruchu do zewnatrz: nie pobieramy nic z internetu przy starcie.
+  allow_user_auth: false

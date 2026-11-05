@@ -1,0 +1,6 @@
+# Nigdy nie commitujemy wygenerowanych kluczy i certyfikatow.
+# Dopuszczone sa tylko pliki ponizej.
+*
+!.gitignore
+!README.md
+!gen-dev-certs.sh
