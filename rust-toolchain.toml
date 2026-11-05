@@ -1,0 +1,6 @@
+# Przypieta wersja toolchaina (reproducible builds). Zmiana wersji = osobny PR.
+# Wersja musi byc dostepna w wewnetrznym mirrorze (rustup dist server), patrz docs/build/supply-chain.md.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

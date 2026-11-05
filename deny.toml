@@ -1,0 +1,53 @@
+# Konfiguracja cargo-deny (https://embarkstudios.github.io/cargo-deny/).
+# Uruchamiane przez ci/check.sh: cargo deny --locked check
+
+[graph]
+all-features = true
+
+[advisories]
+# Baza RustSec. W sieci odcietej: umiesc kopie advisory-db w wewnetrznym mirrorze
+# i wskaz ja w db-urls (patrz docs/build/supply-chain.md).
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    # Wyjatki tylko z uzasadnieniem i data przegladu, np.:
+    # { id = "RUSTSEC-0000-0000", reason = "brak sciezki wywolania; przeglad 2027-01-01" },
+]
+
+[licenses]
+# Dozwolone sa wylacznie licencje permisywne. Wszystko spoza listy jest odrzucane.
+# JAWNIE ZABRONIONE (nie wolno dodawac ich do allow): GPL-2.0, GPL-3.0, AGPL-3.0,
+# LGPL-2.1, LGPL-3.0, SSPL-1.0 (oraz warianty -only / -or-later).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # Przyklad zakazu konkretnego crate'a:
+    # { crate = "openssl-sys", reason = "uzywamy rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Tylko crates.io. Aby przejsc na wewnetrzny mirror (Artifactory/Nexus):
+#  1. ustaw source replacement w .cargo/config.toml (patrz docs/build/supply-chain.md),
+#  2. zastap ponizszy wpis adresem indeksu mirrora, np.
+#     allow-registry = ["sparse+https://artifactory.example.corp/artifactory/api/cargo/crates-remote/index/"]
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
