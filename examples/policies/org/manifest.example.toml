@@ -1,0 +1,26 @@
+# Manifest pakietu polityk warstwy ORG (przyklad). Podpis obejmuje kanoniczna
+# postac tego pliku; skroty SHA-256 wiaza go z trescia plikow .cedar.
+# Wartosc "signature" jest znacznikiem miejsca, nie prawdziwym podpisem.
+
+[bundle]
+layer = "org"
+profile = "firmowy"          # air-gapped | firmowy | hybrydowy (PLAN.md 4.3)
+version = "1.0.0"            # semver pakietu
+serial = 1                   # rosnacy numer; conductord odrzuca nizszy (anti-rollback)
+not_before = "2026-11-05T00:00:00Z"
+expires = "2027-02-05T00:00:00Z"   # po wygasnieciu: ostatni dobry pakiet do konca okresu karencji, potem deny-all
+min_engine = "0.1.0"
+schema = "../schema.cedarschema"
+
+[files]
+"../schema.cedarschema"  = "sha256:fa88108ae85cdab9202c88cf506190b82cf684acdd635fa6c079c6c358387a33"
+"corporate.cedar"        = "sha256:a03beef39fad6c8ac7045fbe947fe1195cb87f211e86026e65e62ce8c1defe31"
+"roles/planner.cedar"    = "sha256:658c68fe0313c5b35633abf5b1f30b0342b88a0badfa8d610ddddf2b8c407dc6"
+"roles/implementer.cedar" = "sha256:eff82445e477a559aed2875bee48f12050f76f6b142bb37e88520599c345c8e6"
+"roles/tester.cedar"     = "sha256:c6df69c0348b5f761a33ac775ae51305be0a5464d0ba848017055c91ceee6177"
+"roles/reviewer.cedar"   = "sha256:9482059b44a7f366a8749b0b186fc085ae0f887c302e38d2046ebf5bb6467acc"
+
+[signature]
+algorithm = "ed25519"
+key_id = "org-policy-2026-01"
+signature = "BASE64-PLACEHOLDER-NOT-A-REAL-SIGNATURE"

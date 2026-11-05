@@ -1,0 +1,63 @@
+// Schemat polityk Conductor (Cedar, format czytelny dla czlowieka).
+// Schemat jest czescia podpisanego pakietu i sluzy do walidacji polityk
+// (typy, literowki w nazwach atrybutow) zanim trafia do conductord.
+//
+// Konwencje wejscia zapewnia conductord, nie polityka:
+//  - sciezki sa znormalizowane i wzgledne wobec worktree (bez "..", bez symlinkow),
+//  - komenda to pojedyncze proste polecenie; zlozone (|, ;, &&, $(...)) sa
+//    rozbijane na skladniki i oceniane osobno albo odrzucane,
+//  - data_class: 0 publiczne, 1 wewnetrzne, 2 poufne, 3 scisle tajne.
+
+entity Agent = {
+  role: String,
+  run_id: String,
+};
+
+entity Repo = {
+  project: String,
+  data_class: Long,
+};
+
+action exec appliesTo {
+  principal: [Agent],
+  resource: [Repo],
+  context: { program: String, command: String },
+};
+
+action fs_read, fs_write appliesTo {
+  principal: [Agent],
+  resource: [Repo],
+  context: { path: String },
+};
+
+action net_connect appliesTo {
+  principal: [Agent],
+  resource: [Repo],
+  context: { host: String, port: Long },
+};
+
+action llm_call appliesTo {
+  principal: [Agent],
+  resource: [Repo],
+  // model_location: "onprem" albo "approved_cloud"
+  context: { model: String, model_location: String },
+};
+
+action mcp_call appliesTo {
+  principal: [Agent],
+  resource: [Repo],
+  // catalog: "internal-signed" dla serwerow z podpisanego katalogu
+  context: { server: String, tool: String, catalog: String },
+};
+
+action git_push appliesTo {
+  principal: [Agent],
+  resource: [Repo],
+  context: { remote: String, branch: String, force: Bool },
+};
+
+action git_merge appliesTo {
+  principal: [Agent],
+  resource: [Repo],
+  context: { source_branch: String, target_branch: String },
+};
