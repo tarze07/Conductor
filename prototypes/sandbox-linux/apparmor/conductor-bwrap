@@ -1,0 +1,38 @@
+# Przykladowy profil AppArmor dla sandboksa Conductora (issue #15). NIE jest instalowany
+# automatycznie; opis w prototypes/sandbox-linux/README.md, sekcja "Seccomp i cgroups".
+#
+# Ubuntu 23.10+ (domyslnie 24.04) ustawia kernel.apparmor_restrict_unprivileged_userns=1:
+# proces bez wlasnego profilu AppArmor moze utworzyc user namespace, ale nie dostaje
+# w nim capabilities, wiec bwrap/unshare bez roota koncza sie bledem. Ten profil pozwala
+# na user namespaces wylacznie programowi wskazanemu sciezka (tu: bubblewrap).
+#
+# Instalacja (administrator, jednorazowo, np. przez paczke Conductora):
+#   sudo install -m 0644 conductor-bwrap /etc/apparmor.d/conductor-bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/conductor-bwrap
+# Sprawdzenie:  sudo aa-status | grep conductor-bwrap
+# Usuniecie:    sudo apparmor_parser -R /etc/apparmor.d/conductor-bwrap && sudo rm /etc/apparmor.d/conductor-bwrap
+#
+# Uwagi:
+# - Profil dotyczy kazdego uzytkownika uruchamiajacego dana sciezke. Lepiej dostarczyc
+#   wlasna kopie bubblewrap (np. /usr/libexec/conductor/bwrap) i zmienic sciezke ponizej,
+#   zeby systemowy /usr/bin/bwrap pozostal objety ograniczeniem.
+# - Nie tworzymy takiego profilu dla /usr/bin/unshare: unshare(1) nie odbiera uprawnien
+#   i nie instaluje seccomp, wiec profil zniosloby ograniczenie dla wszystkich. Na Ubuntu
+#   bez roota uzywaj backendu bwrap.
+# - Docelowo (ADR-002) namespace'y tworzy sam conductord; wtedy profil wskazuje binarke
+#   daemona (przyklad zakomentowany na dole).
+# - Sprawdz, czy dystrybucja nie dostarcza juz profilu dla bwrap: ls /etc/apparmor.d | grep -i bwrap
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile conductor-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/conductor-bwrap>
+}
+
+# profile conductord /usr/bin/conductord flags=(unconfined) {
+#   userns,
+#   include if exists <local/conductord>
+# }

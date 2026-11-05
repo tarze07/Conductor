@@ -103,6 +103,23 @@ Każdy przebieg startuje przez launcher z `prototypes/sandbox-linux/run-sandboxe
 Opcje: `--sandbox-backend auto|bwrap|unshare`, `--sandbox-full-etc` (pełny `/etc`
 zamiast minimalnego). `conductor list` pokazuje kolumnę `SANDBOX`.
 
+Seccomp i limity zasobów (issue #15): launcher instaluje w każdym sandboksie filtr
+seccomp (denylista, opis w `prototypes/sandbox-linux/README.md`). Daemon przekazuje mu
+limity cgroup v2 per przebieg: `--sandbox-pids-max` (domyślnie 4096),
+`--sandbox-memory-max` (8G), `--sandbox-memory-swap-max` (0), `--sandbox-cpu-max`
+(`max`, czyli bez limitu; np. `"200000 100000"` = 2 CPU) i politykę `--sandbox-cgroups
+required|best-effort|off` (domyślnie `best-effort`). Wartości są sprawdzane przy starcie.
+Gdy cgroup v2 nie jest dostępne, przy `best-effort` daemon loguje ostrzeżenie z próbnego
+sandboksa, a agent dostaje je na początku swojego wyjścia; `required` zatrzymuje start
+daemona (próbny sandbox się nie udaje). Limity działają, gdy daemon ma zapisywalną,
+delegowaną hierarchię cgroup v2, np. uruchomiony przez
+`systemd-run --user --scope -p Delegate=yes conductord ...`.
+
+Test `agent_syscalls_filtered` w `tests/sandbox.rs` (oba backendy) uruchamia agenta,
+który próbuje `unshare(CLONE_NEWUSER)`, `unshare -U` i socketów `AF_NETLINK`,
+`AF_PACKET`, `AF_VSOCK` (wszystko `EPERM`), a `AF_INET`, wątki i `fork` działają; sprawdza
+też `Seccomp: 2` i wpisy `seccomp`/`cgroups` w statusie sandboksa.
+
 Test `tests/sandbox.rs` (oba backendy) uruchamia agenta, który próbuje: połączenia do
 hosta z allowlisty (działa), do hosta, którego chciał projekt, a organizacja nie
 pozwala (odrzucone), bezpośredniego TCP (brak sieci), zapisu poza worktree, do
@@ -120,7 +137,12 @@ Ograniczenia integracji:
 - Backend `bwrap` tworzy nową sesję, więc `conductor stop` nie dostarcza agentowi
   łagodnego SIGTERM: sandbox jest zabijany w całości. W backendzie `unshare` agent
   dostaje SIGTERM.
-- Brak seccomp i cgroups (#15), DNS, proxy nadrzędnego i kontroli `git push` (#16).
+- Seccomp to denylista: syscalle nowsze niż tabela (nagłówki jądra 6.8) są przepuszczane,
+  `strace`/`gdb` w sandboksie nie działają (brak trybu debugowania z polityki).
+- Limity cgroup v2 wymagają delegowanej hierarchii; bez niej (domyślne `best-effort`)
+  zostają rlimity i PID namespace. Egzekwowanie limitów nie było testowane w kontenerze
+  deweloperskim (kontrolery przypięte do cgroup v1), tylko polityki i cykl życia podgrupy.
+- Brak DNS, proxy nadrzędnego i kontroli `git push` (#16).
 
 ## Demo: 3 agentów w 3 worktree
 
