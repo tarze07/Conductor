@@ -1,0 +1,10 @@
+[package]
+name = "conductor-proto"
+description = "Typy protokolu JSON-RPC 2.0 conductord i minimalny koder/dekoder JSON (tylko std)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

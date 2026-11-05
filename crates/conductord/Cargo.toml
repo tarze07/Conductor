@@ -1,0 +1,15 @@
+[package]
+name = "conductord"
+description = "Daemon Conductor: IPC, worktree i runtime agentow CLI (prototyp tylko na std)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "conductord"
+path = "src/main.rs"
+
+[dependencies]
+conductor-proto = { path = "../conductor-proto" }
