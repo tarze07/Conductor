@@ -16,14 +16,16 @@ To jest prototyp w Pythonie i Bashu. Docelowa implementacja ma być częścią
 | Plik | Rola |
 |------|------|
 | `run-sandboxed.sh` | Punkt wejścia: `run-sandboxed.sh [opcje] <worktree_dir> -- <komenda>`. Startuje proxy na hoście, tworzy namespace'y, czyści środowisko, sprząta po sobie. Opcje `--ro`/`--rw` (montowania w kolejności, po worktree) i `--etc minimal|full`. Używany przez `conductord` (issue #14). |
-| `egress-proxy.py` | Egress Guard: proxy HTTP CONNECT na unix sockecie, allowlista `host:port`, sprawdzanie SNI, audyt JSON lines. Działa poza sandboksem. |
-| `sandbox-bridge.py` | Most wewnątrz sandboksa: `127.0.0.1:3128` (TCP) -> unix socket proxy. Nie podejmuje decyzji. |
+| `egress-proxy.py` | Egress Guard: proxy HTTP CONNECT na unix sockecie, allowlista `host:port` z flagami, sprawdzanie SNI, filtr adresów po rozwiązaniu nazwy, proxy nadrzędne, terminacja TLS dla forge (reguły `git`), odpowiedzi dla stub DNS, audyt JSON lines. Działa poza sandboksem. |
+| `sandbox-bridge.py` | Most wewnątrz sandboksa: `127.0.0.1:3128` (TCP) -> unix socket proxy. Nie podejmuje decyzji. W trybie `--dns stub` także resolver na `127.0.0.1:53` i przechwytywanie połączeń na fikcyjne adresy. |
 | `sandbox-init.py` | Pierwszy proces w sandboksie: (backend `unshare`) buduje nowy root i robi `pivot_root`, podnosi `lo`, ustawia regułę nft, rlimity, odbiera capabilities, uruchamia most i komendę. |
 | `allowlist.txt` | Przykładowa allowlista. |
-| `test.sh` | Testy (offline, deterministyczne). Na końcu uruchamia `test-hardening.sh`. |
+| `test.sh` | Testy (offline, deterministyczne). Na końcu uruchamia `test-hardening.sh` i `test-egress.sh`. |
 | `sandbox-cgroup.sh` | Limity cgroup v2 per przebieg, wczytywany przez `run-sandboxed.sh` (issue #15). |
 | `test-hardening.sh` | Testy filtra seccomp, polityk cgroups i komunikatu o zablokowanych user namespaces (issue #15). |
 | `apparmor/conductor-bwrap` | Przykładowy profil AppArmor dla Ubuntu 24.04+ (nieinstalowany). |
+| `test-egress.sh` | Testy Egress Guard z issue #16 (rebinding, proxy nadrzędne, stub DNS, git) w hermetycznym network/mount namespace. |
+| `test-forge.py`, `test-upstream-proxy.py` | Pomocnicze serwery testowe: forge HTTPS z `git http-backend` i proxy nadrzędne CONNECT z własną allowlistą. Używane też przez `crates/conductord/tests/sandbox.rs`. |
 
 ## Jak to działa
 
@@ -86,13 +88,17 @@ Opcje mają odpowiedniki w zmiennych środowiskowych: `SANDBOX_ALLOWLIST`,
 `SANDBOX_ID`, `SANDBOX_NOFILE`, `SANDBOX_NPROC`. `CONDUCTOR_SANDBOX_DEBUG=1` wypisuje
 stan sandboksa na stderr.
 
-Format allowlisty (jedna reguła na linię):
+Format allowlisty (jedna reguła na linię): `host[:port] [plaintext] [loopback] [private] [git]`.
 
 ```
-llm-gateway.corp.example:443      # port domyślny 443
-*.mirror.corp.example:443         # wildcard tylko jako pierwszy człon
-localhost:18080 plaintext         # ruch bez TLS dopuszczony jawnie (tu: test)
+llm-gateway.corp.example:443         # port domyślny 443
+*.mirror.corp.example:443            # wildcard tylko jako pierwszy człon
+localhost:18080 plaintext loopback   # ruch bez TLS i adres 127.0.0.1 dopuszczone jawnie (tu: test)
+git.corp.example git                 # forge: terminacja TLS, tylko fetch/clone
+10.20.0.5:8443 private               # literał IP z sieci prywatnej
 ```
+
+Flagi opisuje sekcja „Egress Guard: rebinding, proxy nadrzędne, DNS, git”.
 
 Przykładowy wpis audytu:
 
@@ -102,8 +108,124 @@ Przykładowy wpis audytu:
 
 Powody odmowy: `not_in_allowlist`, `ip_literal`, `sni_mismatch`, `tls_without_sni`,
 `plaintext_not_allowed`, `method_not_allowed`, `bad_request_*`, `client_closed*`,
-`upstream_connect_failed`. Dla tuneli dozwolonych jest też zdarzenie `close`
-z liczbą bajtów i czasem trwania.
+`upstream_connect_failed`, `dns_failed`, a od issue #16 także
+`resolved_to_special_address`, `upstream_proxy_special_address`, `upstream_proxy_refused`,
+`upstream_proxy_connect_failed`, `upstream_proxy_bad_response`, `upstream_proxy_dns_failed`,
+`git_requires_tls`, `git_push_requires_approval`, `git_request_not_allowed`, `git_bad_target`,
+`git_host_mismatch`, `git_bad_*`, `client_tls_failed`, `upstream_tls_failed`,
+`tls_cert_issue_failed`. Dla tuneli dozwolonych jest też zdarzenie `close`
+z liczbą bajtów i czasem trwania; w trybie git zdarzenia `git_request` (z `op`,
+`http_method`, `path`) i `close` (z `http_status`), w trybie stub DNS zdarzenia `dns`.
+
+## Egress Guard: rebinding, proxy nadrzędne, DNS, git
+
+Issue #16. Wszystko poniżej sprawdza `test-egress.sh` (wywoływany na końcu `test.sh`).
+Skrypt uruchamia się w osobnym, pustym network i mount namespace („hermetyczny host”):
+własny loopback, własny `/etc/hosts` z nazwami testowymi i własny `resolv.conf`, który
+wskazuje na „szpiega” DNS zapisującego każde otrzymane zapytanie. Wymaga roota (bez roota: SKIP).
+
+### Filtr adresów po rozwiązaniu nazwy (DNS rebinding)
+
+Proxy rozwiązuje nazwę z allowlisty **raz**, sprawdza **wszystkie** zwrócone adresy
+i łączy się z jednym z tych sprawdzonych adresów (bez drugiego zapytania DNS, więc bez
+TOCTOU). Jeden niedozwolony adres odrzuca całą nazwę (fail closed), z wpisem
+`reason=resolved_to_special_address`, `address`, `address_class`, `address_detail`
+i listą `resolved`. Filtr działa przed odpowiedzią `200`, więc klient dostaje `403`.
+
+| Klasa (`address_class`) | Zakresy | Jak dopuścić |
+|-------------------------|---------|--------------|
+| `loopback` | `127.0.0.0/8`, `::1` | flaga `loopback` |
+| `private` | RFC1918, CGNAT `100.64.0.0/10`, ULA `fc00::/7`, site-local `fec0::/10` | flaga `private` |
+| `link_local` | `169.254.0.0/16` (w tym metadata `169.254.169.254`), `fe80::/10` | nie da się |
+| `unspecified`, `multicast`, `broadcast`, `reserved` | `0.0.0.0/8`, `::`, `224.0.0.0/4`, `ff00::/8`, `255.255.255.255`, `240.0.0.0/4` | nie da się |
+
+Adresy IPv6 z osadzonym IPv4 (`::ffff:a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`,
+IPv4-compatible `::/96`) są oceniane po adresie IPv4 (`address_detail` np.
+`ipv4_mapped:loopback`). Filtr obejmuje też literały IP z allowlisty: `10.20.0.5:8443`
+wymaga flagi `private`. Dotychczasowa reguła testowa `localhost:<port> plaintext`
+wymaga teraz `loopback`.
+
+### Proxy nadrzędne
+
+`run-sandboxed.sh --upstream-proxy http://proxy.corp.example:3128` (albo
+`SANDBOX_UPSTREAM_PROXY`; w daemonie `--egress-upstream-proxy`). Po pozytywnej decyzji
+(allowlista, SNI, tryb git) Egress Guard otwiera tunel `CONNECT host:port` przez proxy
+nadrzędne, podając **nazwę**, nie adres. Cel rozwiązuje wtedy proxy nadrzędne, a filtr
+adresów dotyczy samego proxy nadrzędnego. Firmowe proxy jest zwykle w sieci prywatnej,
+więc klasę jego adresu trzeba dopuścić konfiguracją launchera
+(`--upstream-proxy-allow private`, `loopback` w teście), a nie allowlistą agenta. Bez
+tego: `reason=upstream_proxy_special_address`. Odpowiedź proxy nadrzędnego inna niż `200`
+daje `reason=upstream_proxy_refused` z `upstream_status` i pierwszą linią odpowiedzi.
+Wpisy audytu mają `via=upstream`, `upstream`, `upstream_addr`.
+
+Ograniczenia: bez uwierzytelniania do proxy nadrzędnego (`Proxy-Authorization`, Kerberos,
+NTLM) i tylko `http://` (bez TLS do samego proxy). Ochrona przed rebindingiem celu należy
+wtedy do proxy nadrzędnego.
+
+### Stub DNS w sandboksie (`--dns stub`, domyślnie `none`)
+
+Dla narzędzi, które rozwiązują nazwy przed użyciem proxy (albo nie umieją proxy).
+
+- `sandbox-init.py` (który ma jeszcze capabilities) otwiera gniazda UDP/TCP
+  `127.0.0.1:53` oraz nasłuch `0.0.0.0:<port>` dla każdego portu z allowlisty i przekazuje
+  je mostowi, który działa już bez capabilities. `/etc/resolv.conf` w sandboksie wskazuje
+  na stub (backend `bwrap`: `--ro-bind`, backend `unshare`: bind mount w init; działa też
+  z `--etc full`).
+- Każde zapytanie idzie do Egress Guard (metoda `X-CONDUCTOR-DNS` na tym samym sockecie)
+  i trafia do audytu **poza sandboksem** (`event=dns`, `name`, `qtype`, `decision`).
+  Egress Guard niczego przy tym nie rozwiązuje i niczego nie przekazuje dalej.
+- Nazwa z allowlisty dostaje fikcyjny adres z `127.77.0.0/16` (rekord A, TTL 5 s); AAAA
+  i inne typy dostają pustą odpowiedź (NOERROR bez rekordów), pozostałe nazwy `NXDOMAIN`.
+- Połączenie na fikcyjny adres trafia do nasłuchu mostu, który zamienia je na
+  `CONNECT <nazwa>:<port>` do Egress Guard. Tam obowiązują wszystkie zwykłe reguły
+  (allowlista, filtr adresów, SNI, tryb git).
+
+Kompromisy: porty z allowlisty są w sandboksie zajęte przez most (agent nie zbinduje na
+nich własnego serwera), porty 53 i 3128 nie są przechwytywane; fikcyjne adresy żyją tyle
+co most (pula 4096 nazw na sandbox); brak IPv6; `resolv.conf` leży w zapisywalnym
+`/run` sandboksa, więc agent może go zmienić, ale tylko na własną szkodę (w netns nie ma
+innego resolvera). Bez roota backend `bwrap` w tym trybie uruchamia sandbox jako uid 0 w
+jego user namespace (bwrap z `--dev` tworzy dla innego uid zagnieżdżony userns, w którym
+`CAP_NET_BIND_SERVICE` nie działa w netns sandboksa); komenda agenta nadal ma zero
+capabilities i `no_new_privs`. Tryb `none` zostaje domyślny: brak resolvera to najmniejsza
+powierzchnia.
+
+### Git: `fetch` tak, `push` nie
+
+Reguła z flagą `git` (np. `git.corp.example git`) włącza terminację TLS w Egress Guard:
+
+- Przy starcie proxy generuje (openssl CLI, `cryptography` nie należy do biblioteki
+  standardowej) CA per sandbox: EC P-256, ważne 2 dni, `pathlen:0`. Klucz CA i klucz liścia
+  leżą w `$STATE/tls` (0700) w prywatnym katalogu stanu launchera, który **nie** jest
+  montowany do sandboksa i znika po zakończeniu. Do sandboksa trafia tylko
+  `/run/conductor/egress/sandbox-ca.crt` i paczka systemowe CA + CA sandboksa
+  (`ca-bundle.crt`), wskazana przez `SSL_CERT_FILE`, `GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`,
+  `REQUESTS_CA_BUNDLE` (`NODE_EXTRA_CA_CERTS` dostaje samo CA sandboksa).
+- SNI musi być równe hostowi z CONNECT (jak wcześniej), a ruch bez TLS jest odrzucany
+  (`git_requires_tls`; `git` nie łączy się z `plaintext`). Certyfikat liścia jest
+  wystawiany dla nazwy z CONNECT, z ALPN tylko `http/1.1`.
+- Proxy parsuje jedno żądanie HTTP/1.1 na tunel (wymusza `Connection: close`, sprawdza
+  ramkowanie `Content-Length`/`chunked`, odrzuca nagłówki z gołym CR/LF, `Host` musi
+  wskazywać ten sam host). Dozwolone są tylko `GET …/info/refs?service=git-upload-pack`
+  i `POST …/git-upload-pack`. Wszystko z `git-receive-pack` (także zakodowane w URL)
+  jest odrzucane z `reason=git_push_requires_approval` i odpowiedzią 403, którą git
+  pokazuje użytkownikowi; inne żądania (dumb HTTP, LFS) dają `git_request_not_allowed`.
+- Do forge proxy łączy się dopiero po decyzji, na sprawdzony adres (albo przez proxy
+  nadrzędne), własnym TLS z weryfikacją certyfikatu i nazwy: systemowe CA albo
+  `--upstream-ca FILE`. Błąd weryfikacji: `upstream_tls_failed`.
+- Punkt rozszerzenia: `GitPushApproval.request()` w `egress-proxy.py`. Dziś zawsze zwraca
+  odmowę; integracja z Policy Engine (#20) ma tu pytać `conductord` o zgodę człowieka.
+
+Test: lokalny forge (`test-forge.py`: `http.server` + `ssl` + prawdziwy `git http-backend`,
+z `http.receivepack=true`, więc forge **przyjąłby** push) z certyfikatem z testowego CA.
+W sandboksie `git clone` i `git fetch` działają, `git push` kończy się błędem z
+komunikatem o wymaganej zgodzie, forge nie dostaje żadnego żądania `git-receive-pack`,
+a jego refy się nie zmieniają; ten sam push z hermetycznego hosta bez proxy dociera.
+Bez `--upstream-ca` forge z nieznanym CA jest odrzucany. Prywatny klucz CA nie jest
+widoczny w `/run` ani `/tmp` sandboksa.
+
+Wynik `test-egress.sh` w tym kontenerze (root, backendy `unshare` i `bwrap`, część
+sprawdzeń także jako uid 65534): 130 asercji, liczone razem z `test.sh`.
 
 ## Co prototyp gwarantuje (i co sprawdza `test.sh`)
 
@@ -130,6 +252,9 @@ Sprawdzone w kontenerze deweloperskim (kernel 6.18, root i uid 65534), backendy
 7. Audyt to poprawne JSON lines.
 8. Punkty 1-4 działają także dla użytkownika bez uprawnień (uid 65534) w obu backendach.
 9. Po testach host jest bez zmian: interfejsy, reguły nft, procesy proxy, katalogi stanu.
+10. (issue #16, `test-egress.sh`, 130 asercji doliczanych do sumy `test.sh`) filtr adresów
+    po rozwiązaniu nazwy, proxy nadrzędne, stub DNS bez przekazywania zapytań, git
+    fetch/clone dozwolony i push odrzucony; patrz sekcja „Egress Guard”.
 
 Narzut startu w tym kontenerze: około 0,28 s na `run-sandboxed.sh ... -- true`
 (oba backendy). Większość to start trzech interpreterów Pythona (proxy, init, most);
@@ -278,17 +403,24 @@ Wynik `test-hardening.sh` w kontenerze deweloperskim (root, oba backendy plus ui
 - **nftables w bwrap bez roota** jest pomijane (brak `CAP_NET_ADMIN`), co widać w
   `sandbox-status.json`. Izolacji to nie osłabia: w netns i tak jest tylko `lo`.
 - **Tylko CONNECT.** Zwykłe żądania HTTP przez proxy (absolute-form) są odrzucane.
-  Narzędzia muszą używać tunelu (`curl -p`) albo HTTPS. Brak terminacji TLS, więc proxy
-  nie widzi ścieżek ani metod wewnątrz tunelu (np. nie odróżni `git fetch` od `git push`).
-- **Brak DNS w sandboksie.** Celowo: nazwy rozwiązuje proxy. Narzędzia, które same
-  rozwiązują nazwy przed użyciem proxy, nie zadziałają. Wariant ze stub-resolverem
-  odpowiadającym tylko dla nazw z allowlisty jest opisany w ADR-002, niezaimplementowany.
-- **Brak proxy nadrzędnego.** Proxy łączy się z celem bezpośrednio; nie łańcuchuje do
-  firmowego proxy z `HTTPS_PROXY`. W tym kontenerze nie da się więc przetestować
-  dozwolonego połączenia do prawdziwego hosta w internecie (dlatego test używa lokalnego serwera).
-- **Brak filtra adresów po rozwiązaniu nazwy.** Nazwa z allowlisty wskazująca na
-  loopback lub link-local (DNS rebinding) zostałaby połączona; ADR-002 przewiduje odrzucanie
-  adresów specjalnych.
+  Narzędzia muszą używać tunelu (`curl -p`) albo HTTPS. TLS jest terminowany tylko dla
+  reguł `git`; dla pozostałych hostów proxy nie widzi ścieżek ani metod w tunelu.
+  `git push` jest na razie **zawsze** odrzucany (zgoda człowieka: Policy Engine, #20);
+  push przez SSH do forge nie jest obsługiwany (wymagałby reguły `plaintext`, której
+  proxy nie rozumie, więc nie łączyć jej z hostem forge). Brak obsługi Git LFS i HTTP/2
+  w trybie git.
+- **DNS w sandboksie** jest domyślnie wyłączony (nazwy rozwiązuje proxy). Opcjonalny stub
+  (`--dns stub`) odpowiada tylko dla nazw z allowlisty fikcyjnym adresem IPv4 i nigdy
+  nie przekazuje zapytań; kompromisy w sekcji „Egress Guard”. Brak IPv6 i rekordów
+  innych niż A.
+- **Proxy nadrzędne** (`--upstream-proxy`) tylko `http://`, bez uwierzytelniania
+  (Basic/Kerberos/NTLM) i bez automatycznego wykrywania (PAC, `HTTPS_PROXY` hosta).
+  W tym kontenerze nie testowano go z prawdziwym proxy firmowym ani z hostem w internecie,
+  tylko z lokalnym proxy testowym.
+- **Filtr adresów po rozwiązaniu nazwy** działa, ale proxy używa systemowego resolvera
+  hosta (getaddrinfo, `/etc/hosts`, NSS) i nie przypina adresu dłużej niż na jedno
+  połączenie. Teredo (`2001::/32`) i inne mechanizmy tunelowania IPv6 nie są dekodowane.
+  Przy proxy nadrzędnym rebinding celu musi blokować proxy nadrzędne.
 - **Metadane git** montuje wywołujący (`--ro`/`--rw`, issue #14): `conductord` podaje
   `.git` repo read-only i do zapisu tylko to, czego potrzebuje commit na gałęzi agenta
   (patrz `crates/conductord/README.md`). Sam launcher bez tych opcji git nie obsłuży.

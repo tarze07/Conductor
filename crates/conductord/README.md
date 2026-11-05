@@ -115,6 +115,31 @@ daemona (próbny sandbox się nie udaje). Limity działają, gdy daemon ma zapis
 delegowaną hierarchię cgroup v2, np. uruchomiony przez
 `systemd-run --user --scope -p Delegate=yes conductord ...`.
 
+Egress Guard (issue #16; szczegóły w `prototypes/sandbox-linux/README.md`, sekcja
+„Egress Guard”). Allowlista ma składnię `host[:port] [plaintext] [loopback] [private] [git]`.
+Po rozwiązaniu nazwy Egress Guard odrzuca adresy specjalne (`resolved_to_special_address`):
+loopback i sieci prywatne tylko z flagą `loopback`/`private`, link-local (metadata),
+multicast itp. nigdy. Reguła `git` włącza terminację TLS dla forge: fetch/clone działają,
+`git push` jest odrzucany (`git_push_requires_approval`). Przy łączeniu warstw flagi
+`plaintext`, `loopback` i `private` projektu muszą mieć pokrycie w regule organizacji,
+a `git` z organizacji przechodzi na regułę projektu (projekt nie zdejmie kontroli push).
+Opcje daemona (ustawia administrator, nie projekt):
+
+| Opcja | Znaczenie |
+|-------|-----------|
+| `--egress-upstream-proxy http://host:port` | Egress Guard łączy się z celami przez proxy nadrzędne (tunel CONNECT z nazwą hosta). Bez uwierzytelniania. |
+| `--egress-upstream-proxy-allow loopback,private` | Klasy adresów dopuszczone dla samego proxy nadrzędnego (domyślnie tylko adres publiczny). |
+| `--egress-upstream-ca FILE` | CA do weryfikacji forge w regułach `git` (domyślnie systemowe CA). |
+| `--egress-dns none\|stub` | Stub DNS w sandboksie: odpowiada tylko dla nazw z allowlisty (fikcyjne adresy `127.77.0.0/16`), nigdy nie przekazuje zapytań, każde zapytanie w audycie. Domyślnie `none`. |
+
+Test `agent_git_push_denied` w `tests/sandbox.rs` uruchamia lokalny forge
+(`prototypes/sandbox-linux/test-forge.py`: HTTPS + `git http-backend`, który przyjąłby
+push) i agenta, który klonuje repozytorium, robi fetch i commit, a potem `git push`.
+Organizacja ma regułę `localhost:<port> git loopback`, projekt tę samą bez `git`.
+Clone i fetch działają, push kończy się błędem, forge nie dostaje żadnego żądania
+`git-receive-pack`, a audit log zawiera `run.start` z efektywną regułą
+`localhost:<port> loopback git` i odmowę `git_push_requires_approval`.
+
 Test `agent_syscalls_filtered` w `tests/sandbox.rs` (oba backendy) uruchamia agenta,
 który próbuje `unshare(CLONE_NEWUSER)`, `unshare -U` i socketów `AF_NETLINK`,
 `AF_PACKET`, `AF_VSOCK` (wszystko `EPERM`), a `AF_INET`, wątki i `fork` działają; sprawdza
@@ -142,7 +167,14 @@ Ograniczenia integracji:
 - Limity cgroup v2 wymagają delegowanej hierarchii; bez niej (domyślne `best-effort`)
   zostają rlimity i PID namespace. Egzekwowanie limitów nie było testowane w kontenerze
   deweloperskim (kontrolery przypięte do cgroup v1), tylko polityki i cykl życia podgrupy.
-- Brak DNS, proxy nadrzędnego i kontroli `git push` (#16).
+- `git push` z sandboksa jest zawsze odrzucany (zgoda człowieka przez Policy Engine: #20).
+  Kontrola działa tylko dla HTTPS do hostów z regułą `git`; push przez SSH nie jest
+  kontrolowany, więc forge nie powinien mieć reguły `plaintext` na porcie SSH.
+  Brak Git LFS i HTTP/2 w trybie `git`.
+- Proxy nadrzędne: tylko `http://`, bez uwierzytelniania (Basic, Kerberos, NTLM) i bez PAC;
+  testowane wyłącznie z lokalnym proxy testowym.
+- Stub DNS (`--egress-dns stub`): tylko IPv4 (rekord A), zajmuje w sandboksie porty
+  z allowlisty (przechwytywanie), porty 53 i 3128 nie są przechwytywane.
 
 ## Demo: 3 agentów w 3 worktree
 

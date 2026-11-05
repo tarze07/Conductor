@@ -294,6 +294,42 @@ blokadzie (np. `kernel.apparmor_restrict_unprivileged_userns=1`) kończy się cz
 komunikatem; przykładowy profil AppArmor dla bubblewrapa jest w
 `prototypes/sandbox-linux/apparmor/` (nieinstalowany, nietestowany na Ubuntu).
 
+### Egress Guard: rebinding, proxy nadrzędne, DNS i git (issue #16)
+
+Prototyp (`egress-proxy.py`, `sandbox-bridge.py`, `test-egress.sh`) realizuje punkty 3-4
+decyzji E2 oraz kontrolę `git push`:
+
+- **Filtr adresów.** Proxy rozwiązuje nazwę raz, sprawdza wszystkie adresy i łączy się
+  z jednym z nich (bez TOCTOU). Loopback i sieci prywatne (RFC1918, CGNAT, ULA) wymagają
+  jawnej flagi reguły (`loopback`, `private`); link-local (metadata), unspecified,
+  multicast, broadcast i zarezerwowane są odrzucane zawsze; IPv6 z osadzonym IPv4
+  (mapped, NAT64, 6to4) jest oceniane po IPv4. Odmowa: `resolved_to_special_address`.
+  Składnia allowlisty: `host[:port] [plaintext] [loopback] [private] [git]`; w
+  `conductord` flagi poszerzające projektu muszą być pokryte przez organizację, a `git`
+  z organizacji przechodzi na regułę projektu.
+- **Proxy nadrzędne.** `--upstream-proxy http://host:port`: po pozytywnej decyzji
+  tunel `CONNECT nazwa:port` przez proxy nadrzędne; filtr adresów dotyczy wtedy samego
+  proxy nadrzędnego, a dopuszczenie jego klasy (zwykle `private`) daje konfiguracja
+  launchera/daemona, nie allowlista agenta. Odmowa nadrzędnego: `upstream_proxy_refused`
+  z kodem. Bez uwierzytelniania do proxy nadrzędnego.
+- **Stub DNS** (`--dns stub`, domyślnie `none`): resolver w moście na `127.0.0.1:53`,
+  decyzja i audyt każdego zapytania w Egress Guard (poza sandboksem), fikcyjne adresy
+  `127.77.0.0/16` dla nazw z allowlisty, `NXDOMAIN` dla reszty, bez przekazywania zapytań.
+  Połączenia na fikcyjne adresy most przechwytuje i zamienia na `CONNECT nazwa:port`.
+  Test w hermetycznym netns z „szpiegiem” DNS potwierdza brak przekazywania.
+- **Git.** Dla reguł `git` proxy terminuje TLS certyfikatem z CA generowanego per sandbox
+  (openssl CLI; klucz w prywatnym katalogu stanu launchera, do sandboksa trafia tylko
+  certyfikat), przepuszcza tylko smart HTTP `git-upload-pack`, odrzuca `git-receive-pack`
+  (`git_push_requires_approval`) i łączy się z forge własnym TLS z weryfikacją (systemowe
+  CA albo `--upstream-ca`). Zgoda człowieka na push to punkt rozszerzenia
+  (`GitPushApproval`) dla Policy Engine (#20); dziś push jest zawsze odrzucany. Test
+  używa prawdziwego `git http-backend`: clone/fetch działają, push nie dociera do forge.
+
+Tym samym decyzja z punktu 6 „Dalszych kroków” (terminacja TLS dla forge) jest
+prototypowo podjęta w wąskim zakresie: tylko hosty oznaczone `git`, tylko HTTP/1.1,
+jedno żądanie na tunel. Pełny ADR o terminacji TLS (firmowe CA zamiast CA per sandbox,
+LFS, HTTP/2, polityki per ścieżka dla innych hostów) nadal jest potrzebny.
+
 ## Konsekwencje
 
 Pozytywne:
@@ -308,8 +344,10 @@ Pozytywne:
 Negatywne:
 - Narzędzia bez obsługi `HTTPS_PROXY` wymagają wrapperów; narzędzia, które same
   rozwiązują nazwy, wymagają stub resolvera.
-- Proxy CONNECT bez terminacji TLS nie widzi treści: nie odróżni `git fetch` od `git push`
-  do dozwolonego forge. Kontrola na poziomie metod wymaga terminacji TLS (osobna decyzja).
+- Proxy CONNECT bez terminacji TLS nie widzi treści. Dla forge (reguły `git`) proxy
+  terminuje TLS własnym CA per sandbox, co oznacza utrzymanie parsera HTTP/1.1 w Egress
+  Guard i zaufanie agenta do tego CA; push przez SSH nie jest kontrolowany i nie wolno
+  dopuszczać go regułą `plaintext`.
 - macOS: koszt VM (pamięć) i brak natywnych narzędzi Apple w sandboksie L1; tryb
   `sandbox-exec` jest słabszy i oparty na przestarzałym API.
 - Windows: zależność od WSL2 i jego trybów sieci; jednorazowe włączenie funkcji przez IT.
@@ -322,10 +360,13 @@ Dalsze kroki:
 1. Implementacja L1 w `conductord` (Rust): namespaces, mount API, seccomp (np. `seccompiler`),
    cgroup v2 przez systemd; bubblewrap jako backend przejściowy.
 2. Egress Guard w `conductord`: allowlista z Policy Engine, socket per sandbox, filtr
-   adresów specjalnych po rozwiązaniu nazwy, proxy nadrzędne, audyt z łańcuchem hashy.
-3. Stub resolver ograniczony do allowlisty (opcjonalny, włączany polityką).
+   adresów specjalnych po rozwiązaniu nazwy, proxy nadrzędne (z uwierzytelnianiem),
+   audyt z łańcuchem hashy (prototyp filtra i proxy nadrzędnego: issue #16).
+3. Stub resolver ograniczony do allowlisty (prototyp: issue #16, `--dns stub`);
+   w Ruście, z IPv6 i bez zajmowania portów sandboksa.
 4. Prototyp M1 (Lima: obraz, virtiofs tylko dla worktree, przekazanie unix socketu proxy,
    brak sieci user-mode) i W1 (dystrybucja WSL2, `wsl.conf`, blokada interop i vsock).
 5. Testy bezpieczeństwa w CI na każdą platformę (rozszerzony `test.sh`: seccomp, vsock,
    rebinding DNS, ECH).
-6. Osobny ADR o terminacji TLS dla forge i polityce na poziomie metod HTTP.
+6. Osobny ADR o terminacji TLS dla forge i polityce na poziomie metod HTTP
+   (prototyp trybu `git` z issue #16) oraz zgoda człowieka na `git push` przez Policy Engine (#20).

@@ -60,7 +60,7 @@ mkdir -p "$T/www"; echo "hello-from-gateway" > "$T/www/hello.txt"
 "$PY" -m http.server "$PORT" --bind 127.0.0.1 --directory "$T/www" >/dev/null 2>&1 &
 HTTP_PID=$!
 for _ in $(seq 1 100); do curl -s --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.05; done
-echo "localhost:$PORT plaintext" > "$T/allowlist.txt"
+echo "localhost:$PORT plaintext loopback" > "$T/allowlist.txt"
 
 # --- sonda syscalli (uruchamiana w sandboksie): drukuje "nazwa=wynik" ---------------------
 # Numery syscalli sa niezalezne od tabel w sandbox-init.py (te sprawdza krok 1).

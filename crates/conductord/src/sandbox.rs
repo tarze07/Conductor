@@ -41,6 +41,8 @@ pub struct SandboxConfig {
     pub full_etc: bool,
     /// Limity zasobów cgroup v2 (issue #15).
     pub limits: Limits,
+    /// Egress Guard (#16): opcje przekazywane launcherowi bez zmian.
+    pub egress: EgressOptions,
 }
 
 // --- limity zasobów (cgroup v2, issue #15) ---------------------------------------
@@ -127,23 +129,85 @@ impl Limits {
     }
 }
 
+/// Opcje Egress Guard ustawiane przez administratora daemona (nie przez projekt).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressOptions {
+    /// `http://host:port` proxy nadrzędnego (`--upstream-proxy`).
+    pub upstream_proxy: Option<String>,
+    /// Klasy adresów dopuszczone dla proxy nadrzędnego: `loopback`, `private`.
+    pub upstream_proxy_allow: Vec<String>,
+    /// CA do weryfikacji forge w regułach `git` (`--upstream-ca`).
+    pub upstream_ca: Option<PathBuf>,
+    /// Stub DNS w sandboksie (`--dns stub`).
+    pub dns_stub: bool,
+}
+
+impl EgressOptions {
+    fn launcher_args(&self) -> Result<Vec<String>, String> {
+        let mut a = Vec::new();
+        if let Some(u) = &self.upstream_proxy {
+            a.extend(["--upstream-proxy".into(), u.clone()]);
+        }
+        if !self.upstream_proxy_allow.is_empty() {
+            a.extend([
+                "--upstream-proxy-allow".into(),
+                self.upstream_proxy_allow.join(","),
+            ]);
+        }
+        if let Some(ca) = &self.upstream_ca {
+            a.extend(["--upstream-ca".into(), path_str(ca)?]);
+        }
+        if self.dns_stub {
+            a.extend(["--dns".into(), "stub".into()]);
+        }
+        Ok(a)
+    }
+}
+
 // --- allowlista -----------------------------------------------------------------
 
-/// Reguła allowlisty: `host[:port] [plaintext]`, wildcard tylko jako `*.` na początku.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Reguła allowlisty: `host[:port] [plaintext] [loopback] [private] [git]`,
+/// wildcard tylko jako `*.` na początku.
+///
+/// - `plaintext`: ruch bez TLS w tunelu,
+/// - `loopback`: nazwa może się rozwiązać na 127.0.0.0/8 / ::1,
+/// - `private`: nazwa może się rozwiązać na RFC1918, CGNAT 100.64/10, ULA fc00::/7,
+/// - `git`: terminacja TLS w Egress Guard, tylko fetch/clone, push odrzucany.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rule {
     pub host: String,
     pub port: u16,
     pub plaintext: bool,
+    pub loopback: bool,
+    pub private: bool,
+    pub git: bool,
 }
 
 impl Rule {
     fn render(&self) -> String {
         let mut s = format!("{}:{}", self.host, self.port);
-        if self.plaintext {
-            s.push_str(" plaintext");
+        for (on, name) in [
+            (self.plaintext, "plaintext"),
+            (self.loopback, "loopback"),
+            (self.private, "private"),
+            (self.git, "git"),
+        ] {
+            if on {
+                s.push(' ');
+                s.push_str(name);
+            }
         }
         s
+    }
+
+    /// Czy reguła organizacji `org` obejmuje regułę projektu (bez flagi `git`,
+    /// która tylko zawęża i jest dziedziczona z organizacji).
+    fn covered_by(&self, org: &Rule) -> bool {
+        org.port == self.port
+            && host_covers(&org.host, &self.host)
+            && (org.plaintext || !self.plaintext)
+            && (org.loopback || !self.loopback)
+            && (org.private || !self.private)
     }
 }
 
@@ -173,13 +237,28 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<Rule>, String> {
         let err = |m: &str| format!("line {}: {m}: `{}`", i + 1, raw.trim());
         let mut parts = line.split_whitespace();
         let target = parts.next().unwrap_or_default().to_ascii_lowercase();
-        let plaintext = match parts.next() {
-            None => false,
-            Some("plaintext") => true,
-            Some(_) => return Err(err("unknown flag (only `plaintext` is allowed)")),
-        };
-        if parts.next().is_some() {
-            return Err(err("too many fields"));
+        let mut rule = Rule::default();
+        for flag in parts {
+            let slot = match flag {
+                "plaintext" => &mut rule.plaintext,
+                "loopback" => &mut rule.loopback,
+                "private" => &mut rule.private,
+                "git" => &mut rule.git,
+                _ => {
+                    return Err(err(
+                        "unknown flag (allowed: `plaintext`, `loopback`, `private`, `git`)",
+                    ))
+                }
+            };
+            if *slot {
+                return Err(err("duplicate flag"));
+            }
+            *slot = true;
+        }
+        if rule.git && rule.plaintext {
+            return Err(err(
+                "`git` requires TLS and cannot be combined with `plaintext`",
+            ));
         }
         let (host, port) = match target.rsplit_once(':') {
             Some((h, p)) => (
@@ -194,11 +273,7 @@ pub fn parse_allowlist(text: &str) -> Result<Vec<Rule>, String> {
         if !valid_host(&host) {
             return Err(err("invalid host name"));
         }
-        rules.push(Rule {
-            host,
-            port,
-            plaintext,
-        });
+        rules.push(Rule { host, port, ..rule });
     }
     Ok(rules)
 }
@@ -227,6 +302,8 @@ pub struct Effective {
 
 /// Niższa warstwa (projekt) może tylko zawężać wyższą (organizację), ADR-003.
 /// Brak allowlisty organizacji oznacza brak dostępu do sieci.
+/// Flagi poszerzające (`plaintext`, `loopback`, `private`) projektu muszą być w regule
+/// organizacji; flaga `git` (zawężająca) przechodzi z organizacji na regułę projektu.
 pub fn effective_allowlist(org: Option<&[Rule]>, project: Option<&[Rule]>) -> Effective {
     match (org, project) {
         (None, p) => Effective {
@@ -238,13 +315,18 @@ pub fn effective_allowlist(org: Option<&[Rule]>, project: Option<&[Rule]>) -> Ef
             dropped: Vec::new(),
         },
         (Some(o), Some(p)) => {
-            let (rules, dropped) = p.iter().cloned().partition(|r| {
-                o.iter().any(|or| {
-                    or.port == r.port
-                        && host_covers(&or.host, &r.host)
-                        && (or.plaintext || !r.plaintext)
-                })
-            });
+            let mut rules = Vec::new();
+            let mut dropped = Vec::new();
+            for r in p {
+                let covering: Vec<&Rule> = o.iter().filter(|or| r.covered_by(or)).collect();
+                if covering.is_empty() {
+                    dropped.push(r.clone());
+                } else {
+                    // Projekt nie może zdjąć kontroli git nałożonej przez organizację.
+                    let git = r.git || covering.iter().any(|or| or.git);
+                    rules.push(Rule { git, ..r.clone() });
+                }
+            }
             Effective { rules, dropped }
         }
     }
@@ -489,6 +571,7 @@ impl Sandbox {
             argv.extend(["--backend".into(), b.clone()]);
         }
         argv.extend(self.cfg.limits.args());
+        argv.extend(self.cfg.egress.launcher_args()?);
         for (k, _) in &inner {
             argv.extend(["--pass-env".into(), k.clone()]);
         }
@@ -618,7 +701,14 @@ mod tests {
             host: host.into(),
             port,
             plaintext,
+            ..Rule::default()
         }
+    }
+
+    fn rf(host: &str, port: u16, flags: &str) -> Rule {
+        parse_allowlist(&format!("{host}:{port} {flags}"))
+            .unwrap()
+            .remove(0)
     }
 
     #[test]
@@ -649,9 +739,98 @@ mod tests {
             "-bad.example",
             "1.1.1.1:443:1",
             "under_score.example",
+            "host:443 git plaintext",
+            "host:443 loopback loopback",
+            "host:443 public",
         ] {
             assert!(parse_allowlist(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn parses_flags() {
+        let rules = parse_allowlist(
+            "localhost:8080 plaintext loopback\ngit.corp.example git\n10.0.0.5:8443 private\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rules[0],
+            Rule {
+                host: "localhost".into(),
+                port: 8080,
+                plaintext: true,
+                loopback: true,
+                ..Rule::default()
+            }
+        );
+        assert!(rules[1].git && !rules[1].plaintext && rules[1].port == 443);
+        assert!(rules[2].private && !rules[2].loopback);
+        assert_eq!(rules[0].render(), "localhost:8080 plaintext loopback");
+        assert_eq!(
+            rf("a.example", 443, "git private").render(),
+            "a.example:443 private git"
+        );
+    }
+
+    #[test]
+    fn layers_address_and_git_flags() {
+        let org = vec![
+            rf("localhost", 8080, "plaintext loopback"),
+            rf("*.corp.example", 443, ""),
+            rf("git.corp.example", 443, "git"),
+            rf("db.corp.example", 443, "private"),
+        ];
+        let project = vec![
+            rf("localhost", 8080, "plaintext loopback"),
+            rf("llm.corp.example", 443, "private"),
+            rf("git.corp.example", 443, ""),
+            rf("db.corp.example", 443, "private"),
+            rf("x.corp.example", 443, "git"),
+        ];
+        let e = effective_allowlist(Some(&org), Some(&project));
+        assert_eq!(
+            e.rules,
+            vec![
+                rf("localhost", 8080, "plaintext loopback"),
+                // `git` z organizacji przechodzi na regułę projektu bez tej flagi.
+                rf("git.corp.example", 443, "git"),
+                rf("db.corp.example", 443, "private"),
+                // Projekt może sam zawęzić regułę do trybu git.
+                rf("x.corp.example", 443, "git"),
+            ]
+        );
+        // `private` projektu nie jest pokryte przez `*.corp.example` bez tej flagi.
+        assert_eq!(e.dropped, vec![rf("llm.corp.example", 443, "private")]);
+        // `loopback` projektu wymaga `loopback` w organizacji.
+        let e = effective_allowlist(
+            Some(&[rf("localhost", 8080, "plaintext")]),
+            Some(&[rf("localhost", 8080, "plaintext loopback")]),
+        );
+        assert!(e.rules.is_empty());
+    }
+
+    #[test]
+    fn egress_launcher_args() {
+        assert!(EgressOptions::default().launcher_args().unwrap().is_empty());
+        let o = EgressOptions {
+            upstream_proxy: Some("http://proxy.corp.example:3128".into()),
+            upstream_proxy_allow: vec!["private".into(), "loopback".into()],
+            upstream_ca: Some("/etc/conductor/forge-ca.pem".into()),
+            dns_stub: true,
+        };
+        assert_eq!(
+            o.launcher_args().unwrap(),
+            [
+                "--upstream-proxy",
+                "http://proxy.corp.example:3128",
+                "--upstream-proxy-allow",
+                "private,loopback",
+                "--upstream-ca",
+                "/etc/conductor/forge-ca.pem",
+                "--dns",
+                "stub"
+            ]
+        );
     }
 
     #[test]
