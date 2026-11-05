@@ -1,0 +1,223 @@
+# Testowy LLM Gateway Conductora (issue #13).
+#
+#   nginx (mTLS) -> LiteLLM proxy -> vLLM (profil gpu) | Ollama (profil cpu)
+#                                 -> Postgres (profil db: klucze, zespoly, budzety, logi)
+#
+# Uruchomienie (szczegoly: docs/llm-gateway.md):
+#   export LITELLM_MASTER_KEY=sk-$(openssl rand -hex 24)
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+#   ./tls/gen-dev-certs.sh ./tls
+#   docker compose --profile cpu --profile db up -d            # test lokalny bez GPU
+#   docker compose --profile gpu --profile db up -d            # pilotaz na GPU
+#
+# Obrazy sa przypiete do konkretnych tagow. W srodowisku produkcyjnym przypnij
+# dodatkowo digesty (image@sha256:...) z wewnetrznego rejestru.
+#
+# Siec:
+#   edge     - jedyna siec z wyjsciem na zewnatrz; tylko nginx (publikuje port 8443)
+#   gateway  - internal: nginx <-> LiteLLM
+#   backend  - internal: LiteLLM <-> modele <-> Postgres; brak trasy do internetu
+#   egress   - uzywana wylacznie przez jednorazowy job ollama-pull (profil cpu-pull)
+
+name: conductor-llm-gateway
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  nginx:
+    <<: *hardening
+    image: ${NGINX_IMAGE:-nginx:1.27.5-alpine}
+    depends_on:
+      litellm:
+        condition: service_healthy
+    ports:
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT:-8443}:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./tls/server.crt:/etc/nginx/tls/server.crt:ro
+      - ./tls/server.key:/etc/nginx/tls/server.key:ro
+      - ./tls/ca.crt:/etc/nginx/tls/ca.crt:ro
+    networks: [edge, gateway]
+    read_only: true
+    tmpfs: [/var/cache/nginx, /var/run, /tmp]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8081/nginx-health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  litellm:
+    <<: *hardening
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-v1.108.0}
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?ustaw LITELLM_MASTER_KEY}
+      # Z profilem db ustaw DATABASE_URL (patrz docs/llm-gateway.md); bez bazy dzialaja
+      # tylko master key i budzet globalny, bez kluczy wirtualnych i budzetow zespolow.
+      # Wartosc bez przypisania: przekazywana z shella tylko, gdy jest ustawiona (pusty
+      # DATABASE_URL powoduje blad startu LiteLLM).
+      DATABASE_URL:
+      STORE_MODEL_IN_DB: "False"
+      # Adresy backendow modeli. Domyslnie profil cpu (Ollama); dla gpu zob. docs.
+      FAST_API_BASE: ${FAST_API_BASE:-http://ollama:11434/v1}
+      FAST_MODEL: ${FAST_MODEL:-hosted_vllm/qwen2.5-coder:1.5b}
+      CODER_API_BASE: ${CODER_API_BASE:-http://ollama:11434/v1}
+      CODER_MODEL: ${CODER_MODEL:-hosted_vllm/qwen2.5-coder:1.5b}
+      PLANNER_API_BASE: ${PLANNER_API_BASE:-http://ollama:11434/v1}
+      PLANNER_MODEL: ${PLANNER_MODEL:-hosted_vllm/qwen2.5-coder:1.5b}
+      REVIEWER_API_BASE: ${REVIEWER_API_BASE:-http://ollama:11434/v1}
+      REVIEWER_MODEL: ${REVIEWER_MODEL:-hosted_vllm/qwen2.5-coder:1.5b}
+      BACKEND_API_KEY: ${BACKEND_API_KEY:-none}
+      # --- Telemetria i phone-home: wylaczone ---
+      # Telemetria uzycia LiteLLM (w nowszych wersjach opt-in; ta zmienna to weto administratora).
+      LITELLM_TELEMETRY_DISABLED: "true"
+      # Starsze wersje LiteLLM (przed pakietem litellm.telemetry); nieszkodliwe w nowszych.
+      LITELLM_TELEMETRY: "False"
+      # Nie pobieraj z GitHub tabeli cen/kontekstu modeli, wpisow bloga ani naglowkow beta Anthropic.
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      LITELLM_LOCAL_BLOG_POSTS: "True"
+      LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS: "True"
+      # Bez Swaggera/ReDoc zaciagajacego zasoby z CDN; UI admina wylaczone w tym pilotazu.
+      NO_DOCS: "True"
+      NO_REDOC: "True"
+      DISABLE_ADMIN_UI: "True"
+      DO_NOT_TRACK: "1"
+      # Jawnie: zadnych kluczy zewnetrznych providerow w tym kontenerze.
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      JSON_LOGS: "True"
+      LITELLM_LOG: INFO
+      # Brak wyjscia na internet; ta zmienna to dodatkowy bezpiecznik dla bibliotek HTTP.
+      NO_PROXY: "*"
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    networks: [gateway, backend]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # --- Profil db: Postgres na klucze wirtualne, zespoly, budzety i logi zapytan ---
+  postgres:
+    <<: *hardening
+    profiles: [db]
+    image: ${POSTGRES_IMAGE:-postgres:16.9-alpine}
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?ustaw POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # --- Profil cpu: Ollama z malym modelem do testow lokalnych ---
+  ollama:
+    <<: *hardening
+    profiles: [cpu]
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.12.11}
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: 30m
+      # Ollama nie sprawdza aktualizacji ani nie wysyla telemetrii; siec internal i tak
+      # odcina mu internet. Modele laduje job ollama-pull.
+      OLLAMA_NOPRUNE: "1"
+    volumes:
+      - ollama:/root/.ollama
+    networks: [backend]
+
+  # Jednorazowy job: pobiera model do wolumenu (jedyny element z dostepem do internetu).
+  # W srodowisku firmowym wskaz wewnetrzny mirror (OLLAMA_REGISTRY_HOST) albo zaladuj model
+  # z nosnika. Uruchom: docker compose --profile cpu-pull run --rm ollama-pull
+  ollama-pull:
+    profiles: [cpu-pull]
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.12.11}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama serve & sleep 5; ollama pull ${OLLAMA_TEST_MODEL:-qwen2.5-coder:1.5b}; kill %1"]
+    volumes:
+      - ollama:/root/.ollama
+    networks: [egress]
+
+  # --- Profil gpu: vLLM. Wagi modeli wczesniej pobrane do ${MODELS_DIR} (tryb offline) ---
+  vllm-coder:
+    <<: *hardening
+    profiles: [gpu]
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.33.0}
+    command:
+      - --model=/models/${CODER_MODEL_DIR:-Qwen3.6-27B}
+      - --served-model-name=coder
+      - --max-model-len=${CODER_MAX_LEN:-65536}
+      - --gpu-memory-utilization=0.90
+      - --enable-auto-tool-choice
+      - --tool-call-parser=${CODER_TOOL_PARSER:-qwen3_coder}
+      - --api-key=${BACKEND_API_KEY:-none}
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models:ro
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${CODER_GPU_IDS:-0}"]
+              capabilities: [gpu]
+    networks: [backend]
+
+  vllm-fast:
+    <<: *hardening
+    profiles: [gpu]
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.33.0}
+    command:
+      - --model=/models/${FAST_MODEL_DIR:-Qwen3.6-35B-A3B}
+      - --served-model-name=fast
+      - --max-model-len=${FAST_MAX_LEN:-32768}
+      - --gpu-memory-utilization=0.90
+      - --enable-auto-tool-choice
+      - --tool-call-parser=${FAST_TOOL_PARSER:-qwen3_coder}
+      - --api-key=${BACKEND_API_KEY:-none}
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models:ro
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${FAST_GPU_IDS:-1}"]
+              capabilities: [gpu]
+    networks: [backend]
+
+networks:
+  edge: {}
+  gateway:
+    internal: true
+  backend:
+    internal: true
+  egress: {}
+
+volumes:
+  pgdata: {}
+  ollama: {}
