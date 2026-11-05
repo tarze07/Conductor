@@ -225,6 +225,76 @@ def list_interfaces() -> list[str]:
         return [name for _, name in socket.if_nameindex()]
 
 
+# ------------------------------------------------------------------- stub DNS
+
+DNS_STUB_ADDR = ("127.0.0.1", 53)
+RESOLV_CONF = "# conductor dns stub (issue #16): odpowiada tylko dla nazw z allowlisty\n" \
+              "nameserver 127.0.0.1\noptions timeout:2 attempts:2\n"
+
+
+def setup_dns_stub(ports: list[int], backend: str) -> tuple[list[str], list[int]]:
+    """Tryb --dns stub: otwiera gniazda, ktorych most (bez capabilities) sam by nie otworzyl
+    (port 53 i porty < 1024 z allowlisty do przechwytywania), i wskazuje resolv.conf na stub.
+    Zwraca (dodatkowe argumenty mostu, deskryptory do przekazania)."""
+    fds, args = [], []
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(DNS_STUB_ADDR)
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp.bind(DNS_STUB_ADDR)
+    tcp.listen(64)
+    args += ["--dns-udp-fd", str(udp.detach()), "--dns-tcp-fd", str(tcp.detach())]
+    fds += [int(args[1]), int(args[3])]
+    for port in sorted(set(ports)):
+        # 0.0.0.0:<port> w netns z samym lo = wszystkie adresy 127/8, w tym fikcyjne.
+        # Porty zajete przez most (3128) i stub (53) pomijamy.
+        if port in (BRIDGE_LISTEN[1], DNS_STUB_ADDR[1]):
+            log(f"dns stub: port {port} pominiety (konflikt z mostem/stubem)")
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        s.listen(128)
+        fd = s.detach()
+        args += ["--intercept-fd", str(fd)]
+        fds.append(fd)
+    install_resolv_conf(backend)
+    return args, fds
+
+
+def install_resolv_conf(backend: str) -> None:
+    """resolv.conf wskazujacy na stub. Backend bwrap montuje go sam (run-sandboxed.sh);
+    tu obslugujemy backend unshare (init ma CAP_SYS_ADMIN w swoim mount namespace)."""
+    if backend != "unshare":
+        return
+    os.makedirs(RUN_DIR, exist_ok=True)
+    src = RUN_DIR + "/resolv.conf"
+    with open(src, "w") as f:
+        f.write(RESOLV_CONF)
+    target = os.path.realpath("/etc/resolv.conf")
+    if target.startswith("/run/") or target.startswith("/tmp/"):
+        # Symlink (np. systemd-resolved) do prywatnego tmpfs sandboksa: wystarczy plik.
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w") as f:
+            f.write(RESOLV_CONF)
+        return
+    if os.path.lexists("/etc/resolv.conf") and os.path.exists(target):
+        mount(src, "/etc/resolv.conf", None, MS_BIND)
+        mount(None, "/etc/resolv.conf", None, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV)
+        return
+    # Minimalny /etc bez resolv.conf: na chwile zdejmujemy read-only z roota sandboksa,
+    # zeby utworzyc punkt montowania.
+    mount(None, "/", None, MS_BIND | MS_REMOUNT | MS_NOSUID | MS_NODEV)
+    try:
+        if os.path.islink("/etc/resolv.conf"):
+            os.unlink("/etc/resolv.conf")
+        open("/etc/resolv.conf", "w").close()
+        mount(src, "/etc/resolv.conf", None, MS_BIND)
+        mount(None, "/etc/resolv.conf", None, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV)
+    finally:
+        mount(None, "/", None, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV)
+
+
 # ------------------------------------------------------------------ uprawnienia
 
 def drop_privileges() -> None:
@@ -458,6 +528,8 @@ def main() -> int:
     ap.add_argument("--etc", default="minimal", choices=["minimal", "full"])
     ap.add_argument("--etc-entry", action="append", default=[])
     ap.add_argument("--cgroup-status", help="JSON ze stanem cgroup od launchera")
+    ap.add_argument("--dns", default="none", choices=["none", "stub"])
+    ap.add_argument("--dns-port", type=int, action="append", default=[])
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
@@ -479,6 +551,7 @@ def main() -> int:
     status["nftables"] = apply_nft()
     status["interfaces"] = list_interfaces()
     status.update(hardening_status(a.cgroup_status))
+    status["dns"] = a.dns
     os.makedirs(RUN_DIR, exist_ok=True)
     with open(STATUS_FILE, "w") as f:
         json.dump(status, f)
@@ -486,10 +559,13 @@ def main() -> int:
     set_limits()
 
     py = sys.executable or "/usr/bin/python3"
+    dns_args, dns_fds = setup_dns_stub(a.dns_port, a.backend) if a.dns == "stub" else ([], [])
     bridge = subprocess.Popen(
         [py, "-I", BIN_DIR + "/sandbox-bridge.py", "--listen", "%s:%d" % BRIDGE_LISTEN,
-         "--unix", EGRESS_DIR + "/egress.sock"],
+         "--unix", EGRESS_DIR + "/egress.sock"] + dns_args, pass_fds=dns_fds,
         preexec_fn=drop_privileges, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, close_fds=True)
+    for fd in dns_fds:
+        os.close(fd)
     ready, _, _ = select.select([bridge.stdout], [], [], 5.0)
     if not ready or bridge.stdout.readline().strip() != b"ready":
         print("sandbox-init: most do proxy nie wystartowal", file=sys.stderr)

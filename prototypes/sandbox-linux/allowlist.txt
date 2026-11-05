@@ -1,6 +1,8 @@
-# Allowlista Egress Guard (przyklad). Jedna regula na linie: host[:port] [plaintext]
+# Allowlista Egress Guard (przyklad). Jedna regula na linie: host[:port] [plaintext] [loopback] [private] [git]
 # Domyslny port: 443. "plaintext" dopuszcza ruch bez TLS (tylko do testow / sieci zaufanej).
+# "loopback"/"private": nazwa moze sie rozwiazac na 127/8 albo sieci prywatne (domyslnie odrzucane).
+# "git": terminacja TLS dla forge, tylko fetch/clone (push odrzucany do czasu zgody czlowieka, #20).
 # Literaly IP sa odrzucane, chyba ze wpisano je tu jawnie.
 llm-gateway.corp.example:443
-git.corp.example:443
+git.corp.example:443 git
 *.mirror.corp.example:443

@@ -73,7 +73,7 @@ for _ in $(seq 1 100); do curl -s --noproxy '*' -o /dev/null "http://127.0.0.1:$
 
 cat > "$T/allowlist.txt" <<EOF
 # testowa allowlista: tylko lokalny gateway (bez TLS) i przykladowy host firmowy
-localhost:$PORT plaintext
+localhost:$PORT plaintext loopback
 llm-gateway.corp.example:443
 EOF
 
@@ -187,6 +187,13 @@ if [[ $EUID -eq 0 ]] && command -v setpriv >/dev/null 2>&1; then
     echo "        status sandboksa: $(rsbx cat /run/conductor/sandbox-status.json 2>/dev/null)"
   done
 fi
+
+# --- testy Egress Guard z issue #16 (osobny skrypt, wyniki doliczane do sumy) ---------
+echo
+while IFS= read -r line; do
+  printf '%s\n' "$line"
+  case "$line" in "  PASS  "*) PASS=$((PASS + 1)) ;; "  FAIL  "*|"  EXIT  "[1-9]*) FAIL=$((FAIL + 1)) ;; esac
+done < <(TEST_BACKENDS="$TEST_BACKENDS" bash "$DIR/test-egress.sh" 2>&1; echo "  EXIT  $?")
 
 echo
 echo "== sprzatanie"

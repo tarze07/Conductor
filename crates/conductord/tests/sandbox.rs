@@ -160,22 +160,27 @@ fn setup(port: u16) -> (PathBuf, PathBuf) {
     // Projekt prosi o więcej niż pozwala organizacja: evil.example ma zostać odrzucony.
     std::fs::write(
         repo.join(".conductor/egress-allowlist.txt"),
-        format!("localhost:{port} plaintext\nevil.example:443\n"),
+        format!("localhost:{port} plaintext loopback\nevil.example:443\n"),
     )
     .unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "--quiet", "-m", "init"]);
     std::fs::write(
         root.join("org-allowlist.txt"),
-        format!("# organizacja\n*.corp.example:443\nlocalhost:{port} plaintext\n"),
+        format!("# organizacja\n*.corp.example:443\nlocalhost:{port} plaintext loopback\n"),
     )
     .unwrap();
     (root, repo)
 }
 
 fn start_daemon(root: &Path, repo: &Path, backend: &str) -> Env {
+    start_daemon_with(root, repo, backend, &[])
+}
+
+fn start_daemon_with(root: &Path, repo: &Path, backend: &str, extra: &[&str]) -> Env {
     let socket = root.join("run").join("conductord.sock");
     let daemon = Command::new(env!("CARGO_BIN_EXE_conductord"))
+        .args(extra)
         .arg("--socket")
         .arg(&socket)
         .arg("--worktree-root")
@@ -315,7 +320,7 @@ fn run_scenario(backend: &str) {
         .unwrap_or_else(|| panic!("no run.start in audit:\n{audit}"));
     assert!(
         start_line.contains(&format!(
-            "\"egress_allowlist\":[\"localhost:{port} plaintext\"]"
+            "\"egress_allowlist\":[\"localhost:{port} plaintext loopback\"]"
         )),
         "{start_line}"
     );
@@ -477,4 +482,213 @@ fn agent_syscalls_filtered() {
     if bwrap_available() {
         hardening_scenario("bwrap");
     }
+}
+
+// --- issue #16: git push z sandboksa odrzucony przez Egress Guard --------------------
+
+fn prototype(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../prototypes/sandbox-linux")
+        .join(name)
+        .canonicalize()
+        .expect("prototype script exists")
+}
+
+fn git_forge_supported() -> bool {
+    let ok = |c: &mut Command| {
+        c.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    ok(Command::new("openssl").arg("version"))
+        && ok(Command::new("sh").args(["-c", "test -x \"$(git --exec-path)/git-http-backend\""]))
+}
+
+/// Udawany forge: HTTPS + `git http-backend` (prototypes/sandbox-linux/test-forge.py).
+struct Forge {
+    child: Child,
+    port: u16,
+    log: PathBuf,
+}
+
+impl Drop for Forge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_forge(root: &Path, source: &Path) -> Forge {
+    let certs = root.join("forge-certs");
+    let st = Command::new("python3")
+        .arg("-I")
+        .arg(prototype("test-forge.py"))
+        .arg("--gen-certs")
+        .arg(&certs)
+        .args(["--hostname", "localhost"])
+        .status()
+        .unwrap();
+    assert!(st.success(), "forge certificates");
+    let repos = root.join("forge-repos");
+    std::fs::create_dir_all(&repos).unwrap();
+    let bare = repos.join("repo.git");
+    let out = Command::new("git")
+        .args(["clone", "-q", "--bare"])
+        .arg(source)
+        .arg(&bare)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Forge przyjąłby push: odmowa musi pochodzić z Egress Guard.
+    git(&bare, &["config", "http.receivepack", "true"]);
+    let port_file = root.join("forge.port");
+    let log = root.join("forge.log");
+    let child = Command::new("python3")
+        .arg("-I")
+        .arg(prototype("test-forge.py"))
+        .arg("--certs")
+        .arg(&certs)
+        .arg("--repos")
+        .arg(&repos)
+        .arg("--port-file")
+        .arg(&port_file)
+        .arg("--log")
+        .arg(&log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut forge = Forge {
+        child,
+        port: 0,
+        log,
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Some(p) = std::fs::read_to_string(&port_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            forge.port = p;
+            return forge;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("forge did not start");
+}
+
+/// Agent klonuje repozytorium z forge (działa), robi commit i próbuje `git push`
+/// (odrzucony przez Egress Guard z audytem); forge nie dostaje żadnego żądania
+/// `git-receive-pack`, a jego refy się nie zmieniają.
+#[test]
+fn agent_git_push_denied() {
+    if !sandbox_supported() || !git_forge_supported() {
+        eprintln!("SKIP: namespaces, python3, openssl or git http-backend not available");
+        return;
+    }
+    let (root, repo) = setup(1);
+    let forge = start_forge(&root, &repo);
+    let fport = forge.port;
+    // Organizacja nakłada tryb `git` na forge; projekt prosi o ten sam host bez `git`
+    // (tylko `loopback`) i nie może zdjąć kontroli push.
+    std::fs::write(
+        root.join("org-allowlist.txt"),
+        format!("localhost:{fport} git loopback\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".conductor/egress-allowlist.txt"),
+        format!("localhost:{fport} loopback\n"),
+    )
+    .unwrap();
+    let ca = root.join("forge-certs/ca.crt");
+    let env = start_daemon_with(
+        &root,
+        &repo,
+        "unshare",
+        &["--egress-upstream-ca", ca.to_str().unwrap()],
+    );
+    let bare = root.join("forge-repos/repo.git");
+    let refs_before = git(&bare, &["for-each-ref"]);
+
+    let script = r#"
+url="https://localhost:$1/repo.git"
+git clone -q "$url" /tmp/clone && echo CLONE_OK
+cd /tmp/clone || exit 3
+git fetch -q origin && echo FETCH_OK
+echo agent > agent-change.txt && git add agent-change.txt && git commit -qm "agent change" && echo COMMIT_OK
+if git push -q origin HEAD:refs/heads/agent-push 2>/tmp/push.err; then echo PUSH_OK; else echo PUSH_DENIED; fi
+grep -q "requires human approval" /tmp/push.err && echo PUSH_MESSAGE
+exit 0
+"#;
+    let (mut c, _) = Client::connect_authenticated(&env.socket).unwrap();
+    let started = c
+        .run_start(RunStartParams {
+            repo: env.repo.display().to_string(),
+            task: "push task".into(),
+            agent_cmd: vec![
+                "sh".into(),
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                fport.to_string(),
+            ],
+            name: Some("g1".into()),
+        })
+        .unwrap();
+    let (out, code) = output_until_exit(&mut c, &started.run_id);
+    assert_eq!(code, Some(0), "agent output:\n{out}");
+    for marker in [
+        "CLONE_OK",
+        "FETCH_OK",
+        "COMMIT_OK",
+        "PUSH_DENIED",
+        "PUSH_MESSAGE",
+    ] {
+        assert!(out.contains(marker), "missing {marker} in:\n{out}");
+    }
+    assert!(!out.contains("PUSH_OK"), "{out}");
+
+    // Forge: odczyt dotarł, push nie; refy bez zmian.
+    let forge_log = std::fs::read_to_string(&forge.log).unwrap();
+    assert!(forge_log.contains("git-upload-pack"), "{forge_log}");
+    assert!(!forge_log.contains("git-receive-pack"), "{forge_log}");
+    assert_eq!(git(&bare, &["for-each-ref"]), refs_before);
+
+    // Audit log: efektywna reguła ma `git` z organizacji; push odrzucony z powodem.
+    let audit = std::fs::read_to_string(root.join("run/state/audit.jsonl")).unwrap();
+    let start_line = audit
+        .lines()
+        .find(|l| l.contains("\"event\":\"run.start\""))
+        .unwrap_or_else(|| panic!("no run.start in audit:\n{audit}"));
+    assert!(
+        start_line.contains(&format!(
+            "\"egress_allowlist\":[\"localhost:{fport} loopback git\"]"
+        )),
+        "{start_line}"
+    );
+    let guard: Vec<&str> = audit
+        .lines()
+        .filter(|l| {
+            l.contains("\"component\":\"egress-guard\"") && l.contains("\"sandbox\":\"r1\"")
+        })
+        .collect();
+    assert!(
+        guard.iter().any(|l| l.contains("\"event\":\"git_request\"")
+            && l.contains("\"decision\":\"allow\"")
+            && l.contains("\"op\":\"fetch\"")),
+        "no fetch allow entry:\n{audit}"
+    );
+    assert!(
+        guard.iter().any(|l| l.contains("\"event\":\"git_request\"")
+            && l.contains("\"decision\":\"deny\"")
+            && l.contains("\"reason\":\"git_push_requires_approval\"")),
+        "no push deny entry:\n{audit}"
+    );
+    c.run_remove(&started.run_id, true).unwrap();
 }

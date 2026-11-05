@@ -15,6 +15,13 @@
 #   --etc MODE         (SANDBOX_ETC)        minimal (domyslnie) | full: widoczny /etc
 #   --pass-env NAME    (SANDBOX_PASS_ENV, lista ':') zmienne przekazywane do sandboksa
 #   --id NAME          (SANDBOX_ID)         identyfikator sandboksa w audycie
+#   Egress Guard (#16):
+#   --upstream-proxy URL        (SANDBOX_UPSTREAM_PROXY)  http://host:port proxy nadrzednego
+#   --upstream-proxy-allow LIST (SANDBOX_UPSTREAM_PROXY_ALLOW) loopback,private: klasy adresow
+#                      dopuszczone dla proxy nadrzednego (domyslnie: tylko adres publiczny)
+#   --upstream-ca FILE (SANDBOX_UPSTREAM_CA)  CA do weryfikacji forge w regulach "git"
+#   --dns MODE         (SANDBOX_DNS)        none (domyslnie) | stub: resolver w sandboksie
+#                      odpowiadajacy tylko dla nazw z allowlisty (fikcyjne adresy 127.77/16)
 #
 # Limity zasobow, cgroup v2 (issue #15; szczegoly w sandbox-cgroup.sh i README):
 #   --cgroups MODE     (SANDBOX_CGROUPS)    required | best-effort (domyslnie) | off
@@ -40,7 +47,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-$(command -v python3)}"
 
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 2; }
 
 ALLOWLIST="${SANDBOX_ALLOWLIST:-$SCRIPT_DIR/allowlist.txt}"
 AUDIT_LOG="${SANDBOX_AUDIT_LOG:-}"
@@ -56,6 +63,10 @@ source "$SCRIPT_DIR/sandbox-cgroup.sh"
 CG_MODE="${SANDBOX_CGROUPS:-best-effort}"; CG_PIDS_MAX="${SANDBOX_PIDS_MAX:-}"
 CG_MEMORY_MAX="${SANDBOX_MEMORY_MAX:-}"; CG_SWAP_MAX="${SANDBOX_MEMORY_SWAP_MAX:-0}"
 CG_CPU_MAX="${SANDBOX_CPU_MAX:-}"; CG_PARENT="${SANDBOX_CGROUP_PARENT:-}"
+UPSTREAM_PROXY="${SANDBOX_UPSTREAM_PROXY:-}"
+UPSTREAM_PROXY_ALLOW="${SANDBOX_UPSTREAM_PROXY_ALLOW:-}"
+UPSTREAM_CA="${SANDBOX_UPSTREAM_CA:-}"
+DNS_MODE="${SANDBOX_DNS:-none}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -73,6 +84,10 @@ while [[ $# -gt 0 ]]; do
     --memory-swap-max) CG_SWAP_MAX="$2"; shift 2 ;;
     --cpu-max)   CG_CPU_MAX="$2"; shift 2 ;;
     --cgroup-parent) CG_PARENT="$2"; shift 2 ;;
+    --upstream-proxy)       UPSTREAM_PROXY="$2"; shift 2 ;;
+    --upstream-proxy-allow) UPSTREAM_PROXY_ALLOW="$2"; shift 2 ;;
+    --upstream-ca)          UPSTREAM_CA="$2"; shift 2 ;;
+    --dns)                  DNS_MODE="$2"; shift 2 ;;
     -h|--help)   usage ;;
     --) usage ;;
     -*) echo "nieznana opcja: $1" >&2; usage ;;
@@ -117,6 +132,8 @@ userns_preflight() {
   return 1
 }
 if [[ $EUID -ne 0 ]]; then userns_preflight || exit 125; fi
+case "$DNS_MODE" in none|stub) ;; *) echo "nieznany tryb DNS: $DNS_MODE" >&2; exit 2 ;; esac
+[[ -z "$UPSTREAM_CA" ]] || UPSTREAM_CA="$(realpath -e "$UPSTREAM_CA")"
 
 # Sciezki montowan rozwiazane z gory (blad, jesli nie istnieja).
 RESOLVED_MOUNTS=()
@@ -134,7 +151,7 @@ ETC_ENTRIES=(passwd group hosts nsswitch.conf host.conf localtime protocols serv
 # --- katalog stanu (prywatny, usuwany przy wyjsciu) --------------------------------
 STATE="$(mktemp -d "${TMPDIR:-/tmp}/conductor-sbx.XXXXXX")"
 chmod 700 "$STATE"
-mkdir -m 700 "$STATE/egress" "$STATE/root"
+mkdir -m 700 "$STATE/egress" "$STATE/root" "$STATE/tls"
 PROXY_PID=""
 cleanup() {
   cgroup_cleanup
@@ -153,10 +170,17 @@ CG_NAME="conductor-sbx-$$-${STATE##*.}"
 cgroup_setup || exit 125
 
 # --- Egress Guard ------------------------------------------------------------------
+# Klucz CA sandboksa (reguly "git") powstaje w $STATE/tls (0700, poza sandboksem);
+# do sandboksa trafia tylko certyfikat publiczny w $STATE/egress.
+PROXY_OPTS=(--tls-state-dir "$STATE/tls" --ca-public-dir "$STATE/egress")
+[[ -n "$UPSTREAM_PROXY" ]] && PROXY_OPTS+=(--upstream-proxy "$UPSTREAM_PROXY")
+[[ -n "$UPSTREAM_PROXY_ALLOW" ]] && PROXY_OPTS+=(--upstream-proxy-allow "$UPSTREAM_PROXY_ALLOW")
+[[ -n "$UPSTREAM_CA" ]] && PROXY_OPTS+=(--upstream-ca "$UPSTREAM_CA")
+[[ "$DNS_MODE" == stub ]] && PROXY_OPTS+=(--dns-stub --dns-ports-out "$STATE/dns-ports")
 "$PYTHON" -I "$SCRIPT_DIR/egress-proxy.py" \
   --listen-unix "$STATE/egress/egress.sock" \
   --allowlist "$ALLOWLIST" --audit-log "$AUDIT_LOG" --sandbox-id "$SANDBOX_ID" \
-  </dev/null &
+  "${PROXY_OPTS[@]}" </dev/null &
 PROXY_PID=$!
 for _ in $(seq 1 100); do
   [[ -S "$STATE/egress/egress.sock" ]] && break
@@ -177,12 +201,23 @@ ENV_ARGS=(
   "CONDUCTOR_SANDBOX=1" "CONDUCTOR_SANDBOX_ID=$SANDBOX_ID"
 )
 [[ -n "${CONDUCTOR_SANDBOX_DEBUG:-}" ]] && ENV_ARGS+=("CONDUCTOR_SANDBOX_DEBUG=$CONDUCTOR_SANDBOX_DEBUG")
+if [[ -f "$STATE/egress/ca-bundle.crt" ]]; then   # reguly "git": agent ufa CA sandboksa
+  _CA=/run/conductor/egress
+  ENV_ARGS+=("SSL_CERT_FILE=$_CA/ca-bundle.crt" "GIT_SSL_CAINFO=$_CA/ca-bundle.crt"
+             "CURL_CA_BUNDLE=$_CA/ca-bundle.crt" "REQUESTS_CA_BUNDLE=$_CA/ca-bundle.crt"
+             "NODE_EXTRA_CA_CERTS=$_CA/sandbox-ca.crt")
+fi
 for name in "${PASS_ENV[@]}"; do
   [[ -n "$name" && -n "${!name+x}" ]] && ENV_ARGS+=("$name=${!name}")
 done
 
 INIT_ARGS=(--worktree "$WORKTREE" --etc "$ETC_MODE" --cgroup-status "$CG_STATUS")
 for m in "${RESOLVED_MOUNTS[@]}"; do INIT_ARGS+=(--mount "$m"); done
+INIT_ARGS+=(--dns "$DNS_MODE")
+if [[ "$DNS_MODE" == stub ]]; then
+  while read -r p; do [[ -n "$p" ]] && INIT_ARGS+=(--dns-port "$p"); done < "$STATE/dns-ports"
+  printf '# conductor dns stub (issue #16): odpowiada tylko dla nazw z allowlisty\nnameserver 127.0.0.1\noptions timeout:2 attempts:2\n' > "$STATE/resolv.conf"
+fi
 
 rc=0
 if [[ "$BACKEND" == bwrap ]]; then
@@ -207,11 +242,20 @@ if [[ "$BACKEND" == bwrap ]]; then
     if [[ "${m%%:*}" == rw ]]; then BWRAP+=(--bind "${m#*:}" "${m#*:}")
     else BWRAP+=(--ro-bind "${m#*:}" "${m#*:}"); fi
   done
+  [[ "$DNS_MODE" == stub ]] && BWRAP+=(--ro-bind "$STATE/resolv.conf" /etc/resolv.conf)
   BWRAP+=(--remount-ro / --chdir "$WORKTREE")
   # Jako root dajemy init-owi tylko CAP_NET_ADMIN (regula nft w netns sandboksa)
   # i CAP_SETPCAP (zeby mogl wyczyscic bounding set). Init odbiera wszystkie
   # capabilities przed uruchomieniem mostu i komendy agenta.
   if [[ $EUID -eq 0 ]]; then BWRAP+=(--cap-drop ALL --cap-add CAP_NET_ADMIN --cap-add CAP_SETPCAP); fi
+  # Stub DNS: init otwiera port 53 (i porty < 1024 do przechwytywania), potem odbiera wszystko.
+  # Bez roota bwrap z --dev tworzy zagniezdzony userns dla uid != 0, a capabilities z niego
+  # nie dzialaja w netns sandboksa; dlatego w tym trybie sandbox dziala jako uid 0 w swoim
+  # userns (jak backend unshare bez roota), nadal bez capabilities po starcie agenta.
+  if [[ "$DNS_MODE" == stub ]]; then
+    BWRAP+=(--cap-add CAP_NET_BIND_SERVICE)
+    if [[ $EUID -ne 0 ]]; then BWRAP+=(--cap-add CAP_SETPCAP --uid 0 --gid 0); fi
+  fi
   "${CG_EXEC[@]}" env -i "${ENV_ARGS[@]}" "${BWRAP[@]}" -- \
     "$PYTHON" -I /run/conductor/bin/sandbox-init.py --backend bwrap "${INIT_ARGS[@]}" -- "$@" || rc=$?
 else

@@ -12,7 +12,7 @@ mod workspace;
 
 use log::{log_error, log_info};
 use runtime::TtyMode;
-use sandbox::{Limits, SandboxConfig};
+use sandbox::{EgressOptions, Limits, SandboxConfig};
 use server::{Config, Daemon};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -47,6 +47,17 @@ Sandbox (ADR-002), wymagany domyslnie:
   --sandbox-memory-swap-max S  memory.swap.max (domyslnie 0)
   --sandbox-cpu-max \"Q P\" cpu.max, np. \"200000 100000\" = 2 CPU (domyslnie max)
   --no-sandbox           uruchamiaj agentow BEZ izolacji (tylko do testow)
+
+Egress Guard (#16):
+  --egress-upstream-proxy URL
+                         http://host:port proxy nadrzednego (bez uwierzytelniania);
+                         allowlista nadal obowiazuje
+  --egress-upstream-proxy-allow LISTA
+                         loopback,private: klasy adresow dopuszczone dla proxy
+                         nadrzednego (domyslnie: tylko adres publiczny)
+  --egress-upstream-ca F CA do weryfikacji forge w regulach `git` (domyslnie systemowe)
+  --egress-dns MODE      none (domyslnie) | stub: resolver w sandboksie tylko dla
+                         nazw z allowlisty, bez przekazywania zapytan
   -v, --verbose          logi DEBUG
   -h, --help             ta pomoc
   -V, --version          wersja daemona i protokolu
@@ -56,7 +67,7 @@ Sandbox (ADR-002), wymagany domyslnie:
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 enum Cli {
-    Run(Config, bool),
+    Run(Box<Config>, bool),
     Help,
     Version,
 }
@@ -74,6 +85,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut full_etc = false;
     let mut limits = Limits::default();
     let mut no_sandbox = false;
+    let mut egress = EgressOptions::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| {
@@ -117,6 +129,38 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 let v = value(opt)?;
                 limits.set(&opt["--sandbox-".len()..], v)?;
             }
+            "--egress-upstream-proxy" => {
+                let u = value("--egress-upstream-proxy")?;
+                let rest = u
+                    .strip_prefix("http://")
+                    .ok_or("--egress-upstream-proxy must be http://host:port")?;
+                let authority = rest.strip_suffix('/').unwrap_or(rest);
+                if authority.is_empty() || authority.contains(['/', '@', '?', '#']) {
+                    return Err("--egress-upstream-proxy must be http://host:port".into());
+                }
+                egress.upstream_proxy = Some(u);
+            }
+            "--egress-upstream-proxy-allow" => {
+                let v = value("--egress-upstream-proxy-allow")?;
+                for c in v.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+                    if !matches!(c, "loopback" | "private") {
+                        return Err(format!(
+                            "--egress-upstream-proxy-allow: unknown class `{c}` (loopback, private)"
+                        ));
+                    }
+                    if !egress.upstream_proxy_allow.iter().any(|x| x == c) {
+                        egress.upstream_proxy_allow.push(c.to_owned());
+                    }
+                }
+            }
+            "--egress-upstream-ca" => {
+                egress.upstream_ca = Some(PathBuf::from(value("--egress-upstream-ca")?));
+            }
+            "--egress-dns" => match value("--egress-dns")?.as_str() {
+                "stub" => egress.dns_stub = true,
+                "none" => egress.dns_stub = false,
+                other => return Err(format!("unknown --egress-dns mode `{other}` (none, stub)")),
+            },
             "--no-sandbox" => no_sandbox = true,
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => return Ok(Cli::Help),
@@ -151,17 +195,21 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             backend,
             full_etc,
             limits,
+            egress: EgressOptions {
+                upstream_ca: egress.upstream_ca.map(|c| cwd.join(c)),
+                ..egress
+            },
         }),
     };
     Ok(Cli::Run(
-        Config {
+        Box::new(Config {
             socket: cwd.join(socket),
             worktree_root: worktree_root.map(|w| cwd.join(w)),
             ring_bytes,
             stop_timeout,
             tty,
             sandbox,
-        },
+        }),
         verbose,
     ))
 }
@@ -179,7 +227,7 @@ fn main() -> ExitCode {
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cfg, verbose) = match parse_args(&args) {
-        Ok(Cli::Run(cfg, verbose)) => (cfg, verbose),
+        Ok(Cli::Run(cfg, verbose)) => (*cfg, verbose),
         Ok(Cli::Help) => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -289,6 +337,7 @@ mod tests {
                 backend: Some("unshare".into()),
                 full_etc: false,
                 limits: Limits::default(),
+                egress: EgressOptions::default(),
             })
         );
     }
@@ -329,6 +378,45 @@ mod tests {
         ]))
         .is_err());
         assert!(parse_args(&args(&["--sandbox-launcher", "/x", "--sandbox-pids-max"])).is_err());
+    }
+
+    #[test]
+    fn parses_egress_options() {
+        let Cli::Run(cfg, _) = parse_args(&args(&[
+            "--sandbox-launcher",
+            "/opt/run-sandboxed.sh",
+            "--egress-upstream-proxy",
+            "http://proxy.corp.example:3128",
+            "--egress-upstream-proxy-allow",
+            "private,loopback,private",
+            "--egress-upstream-ca",
+            "/etc/conductor/forge-ca.pem",
+            "--egress-dns",
+            "stub",
+        ]))
+        .unwrap() else {
+            panic!("expected Run")
+        };
+        assert_eq!(
+            cfg.sandbox.unwrap().egress,
+            EgressOptions {
+                upstream_proxy: Some("http://proxy.corp.example:3128".into()),
+                upstream_proxy_allow: vec!["private".into(), "loopback".into()],
+                upstream_ca: Some("/etc/conductor/forge-ca.pem".into()),
+                dns_stub: true,
+            }
+        );
+        for bad in [
+            &["--egress-upstream-proxy", "https://proxy:3128"][..],
+            &["--egress-upstream-proxy", "http://user:pw@proxy:3128"],
+            &["--egress-upstream-proxy", "http://"],
+            &["--egress-upstream-proxy-allow", "public"],
+            &["--egress-dns", "forward"],
+        ] {
+            let mut a = vec!["--sandbox-launcher", "/x"];
+            a.extend_from_slice(bad);
+            assert!(parse_args(&args(&a)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
