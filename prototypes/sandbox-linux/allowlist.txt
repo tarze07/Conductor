@@ -1,0 +1,6 @@
+# Allowlista Egress Guard (przyklad). Jedna regula na linie: host[:port] [plaintext]
+# Domyslny port: 443. "plaintext" dopuszcza ruch bez TLS (tylko do testow / sieci zaufanej).
+# Literaly IP sa odrzucane, chyba ze wpisano je tu jawnie.
+llm-gateway.corp.example:443
+git.corp.example:443
+*.mirror.corp.example:443
