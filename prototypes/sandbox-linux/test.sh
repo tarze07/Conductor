@@ -143,6 +143,8 @@ import json, sys; s = json.load(open("/run/conductor/sandbox-status.json")); sys
   check_not "zapis do / sie nie udaje (root read-only)" sbx sh -c 'echo x > /conductor-probe'
   check_not "odczyt pliku hosta spoza worktree ($T/host-file.txt) sie nie udaje" sbx cat "$T/host-file.txt"
   check_not "zapis do /etc sie nie udaje (read-only)" sbx sh -c 'echo x > /etc/conductor-probe'
+  check_not "klucze prywatne hosta (/etc/ssl/private, /etc/pki/tls/private) niewidoczne" sbx sh -c 'test -e /etc/ssl/private || test -e /etc/pki/tls/private'
+  check "certyfikaty CA widoczne (/etc/ssl/certs)" sbx sh -c 'test -d /etc/ssl/certs || test -d /etc/pki/tls/certs'
   check_not "zapis do /usr sie nie udaje (read-only)" sbx sh -c 'echo x > /usr/conductor-probe'
   check_not "katalog domowy hosta ($HOME) jest niewidoczny" sbx test -e "$HOME"
   sbx sh -c 'echo x > /tmp/conductor-probe-'"$B"'' >/dev/null 2>&1

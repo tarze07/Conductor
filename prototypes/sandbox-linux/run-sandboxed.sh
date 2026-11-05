@@ -143,9 +143,13 @@ done
 
 # Minimalny /etc: tylko to, czego potrzebuja typowe narzedzia (libc, TLS, git, python).
 # Bez /etc/gitconfig, /etc/ssh, /etc/sudoers, /etc/shadow, konfiguracji uslug itp.
+# Z /etc/ssl i /etc/pki tylko certyfikaty CA i konfiguracja openssl: katalogi
+# private/ (klucze prywatne hosta) nie sa widoczne.
 ETC_ENTRIES=(passwd group hosts nsswitch.conf host.conf localtime protocols services
-             mime.types ld.so.cache ld.so.conf ld.so.conf.d alternatives ssl
-             ca-certificates ca-certificates.conf pki crypto-policies terminfo inputrc
+             mime.types ld.so.cache ld.so.conf ld.so.conf.d alternatives
+             ssl/certs ssl/openssl.cnf ssl/cert.pem
+             pki/tls/certs pki/tls/openssl.cnf pki/tls/cert.pem pki/ca-trust
+             ca-certificates ca-certificates.conf crypto-policies terminfo inputrc
              os-release debian_version login.defs python3 xdg)
 
 # --- katalog stanu (prywatny, usuwany przy wyjsciu) --------------------------------
