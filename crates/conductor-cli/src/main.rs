@@ -219,7 +219,7 @@ fn parse_start(rest: &[String]) -> Result<Command, String> {
 }
 
 fn print_runs(runs: &[RunInfo]) {
-    let rows: Vec<[String; 7]> = runs
+    let rows: Vec<[String; 8]> = runs
         .iter()
         .map(|r| {
             let exit = match (r.exit_code, r.signal) {
@@ -232,6 +232,7 @@ fn print_runs(runs: &[RunInfo]) {
                 r.name.clone(),
                 r.state.clone(),
                 exit,
+                if r.sandboxed { "yes" } else { "NO" }.to_string(),
                 r.output_bytes.to_string(),
                 r.branch.clone(),
                 r.worktree.clone(),
@@ -239,7 +240,7 @@ fn print_runs(runs: &[RunInfo]) {
         })
         .collect();
     let header = [
-        "ID", "NAME", "STATE", "EXIT", "OUT(B)", "BRANCH", "WORKTREE",
+        "ID", "NAME", "STATE", "EXIT", "SANDBOX", "OUT(B)", "BRANCH", "WORKTREE",
     ]
     .map(String::from);
     let mut widths = header.clone().map(|h| h.len());

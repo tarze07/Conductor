@@ -63,6 +63,8 @@ pub struct SpawnSpec<'a> {
     pub argv: &'a [String],
     pub cwd: &'a Path,
     pub env: Vec<(String, String)>,
+    /// Nie dziedzicz środowiska daemona (tylko `env`). Używane dla launchera sandboksa.
+    pub clear_env: bool,
     pub mode: TtyMode,
     pub ring_bytes: usize,
     /// Etykieta do logów (np. `r1`).
@@ -89,6 +91,9 @@ impl Agent {
             .split_first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty agent_cmd"))?;
         let mut cmd = Command::new(prog);
+        if spec.clear_env {
+            cmd.env_clear();
+        }
         cmd.args(args)
             .current_dir(spec.cwd)
             .envs(spec.env.iter().cloned());
@@ -317,6 +322,7 @@ mod tests {
             argv: &argv,
             cwd: Path::new("/"),
             env: vec![("FOO".into(), "bar".into())],
+            clear_env: false,
             mode,
             ring_bytes: 4096,
             label: "test".into(),

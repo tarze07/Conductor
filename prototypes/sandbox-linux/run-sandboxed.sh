@@ -8,7 +8,11 @@
 #   --allowlist FILE   (SANDBOX_ALLOWLIST)  domyslnie ./allowlist.txt obok skryptu
 #   --audit-log FILE   (SANDBOX_AUDIT_LOG)  domyslnie <worktree>/../egress-audit.jsonl
 #   --backend NAME     (SANDBOX_BACKEND)    auto | bwrap | unshare  (domyslnie auto)
-#   --ro PATH          (SANDBOX_RO_PATHS, lista rozdzielona ':') dodatkowe toolchainy read-only
+#   --ro PATH          (SANDBOX_RO_PATHS, lista rozdzielona ':') dodatkowa sciezka read-only
+#   --rw PATH          dodatkowa sciezka read-write (np. metadane git worktree)
+#                      --ro/--rw sa montowane w podanej kolejnosci PO worktree, wiec
+#                      pozniejszy wpis moze nadpisac wczesniejszy (np. --ro <wt>/.git)
+#   --etc MODE         (SANDBOX_ETC)        minimal (domyslnie) | full: widoczny /etc
 #   --pass-env NAME    (SANDBOX_PASS_ENV, lista ':') zmienne przekazywane do sandboksa
 #   --id NAME          (SANDBOX_ID)         identyfikator sandboksa w audycie
 #
@@ -26,13 +30,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-$(command -v python3)}"
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 ALLOWLIST="${SANDBOX_ALLOWLIST:-$SCRIPT_DIR/allowlist.txt}"
 AUDIT_LOG="${SANDBOX_AUDIT_LOG:-}"
 BACKEND="${SANDBOX_BACKEND:-auto}"
+ETC_MODE="${SANDBOX_ETC:-minimal}"
 SANDBOX_ID="${SANDBOX_ID:-}"
-IFS=':' read -r -a RO_PATHS <<< "${SANDBOX_RO_PATHS:-}"
+IFS=':' read -r -a _RO_ENV <<< "${SANDBOX_RO_PATHS:-}"
+MOUNTS=()   # "ro:PATH" / "rw:PATH", w kolejnosci
+for p in "${_RO_ENV[@]}"; do [[ -n "$p" ]] && MOUNTS+=("ro:$p"); done
 IFS=':' read -r -a PASS_ENV <<< "${SANDBOX_PASS_ENV:-}"
 
 while [[ $# -gt 0 ]]; do
@@ -40,7 +47,9 @@ while [[ $# -gt 0 ]]; do
     --allowlist) ALLOWLIST="$2"; shift 2 ;;
     --audit-log) AUDIT_LOG="$2"; shift 2 ;;
     --backend)   BACKEND="$2"; shift 2 ;;
-    --ro)        RO_PATHS+=("$2"); shift 2 ;;
+    --ro)        MOUNTS+=("ro:$2"); shift 2 ;;
+    --rw)        MOUNTS+=("rw:$2"); shift 2 ;;
+    --etc)       ETC_MODE="$2"; shift 2 ;;
     --pass-env)  PASS_ENV+=("$2"); shift 2 ;;
     --id)        SANDBOX_ID="$2"; shift 2 ;;
     -h|--help)   usage ;;
@@ -60,6 +69,20 @@ if [[ "$BACKEND" == auto ]]; then
   if command -v bwrap >/dev/null 2>&1; then BACKEND=bwrap; else BACKEND=unshare; fi
 fi
 case "$BACKEND" in bwrap|unshare) ;; *) echo "nieznany backend: $BACKEND" >&2; exit 2 ;; esac
+case "$ETC_MODE" in minimal|full) ;; *) echo "nieznany tryb /etc: $ETC_MODE" >&2; exit 2 ;; esac
+
+# Sciezki montowan rozwiazane z gory (blad, jesli nie istnieja).
+RESOLVED_MOUNTS=()
+for m in "${MOUNTS[@]}"; do
+  RESOLVED_MOUNTS+=("${m%%:*}:$(realpath -e "${m#*:}")")
+done
+
+# Minimalny /etc: tylko to, czego potrzebuja typowe narzedzia (libc, TLS, git, python).
+# Bez /etc/gitconfig, /etc/ssh, /etc/sudoers, /etc/shadow, konfiguracji uslug itp.
+ETC_ENTRIES=(passwd group hosts nsswitch.conf host.conf localtime protocols services
+             mime.types ld.so.cache ld.so.conf ld.so.conf.d alternatives ssl
+             ca-certificates ca-certificates.conf pki crypto-policies terminfo inputrc
+             os-release debian_version login.defs python3 xdg)
 
 # --- katalog stanu (prywatny, usuwany przy wyjsciu) --------------------------------
 STATE="$(mktemp -d "${TMPDIR:-/tmp}/conductor-sbx.XXXXXX")"
@@ -74,7 +97,8 @@ cleanup() {
   rm -rf "$STATE"
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- Egress Guard ------------------------------------------------------------------
 "$PYTHON" -I "$SCRIPT_DIR/egress-proxy.py" \
@@ -105,24 +129,33 @@ for name in "${PASS_ENV[@]}"; do
   [[ -n "$name" && -n "${!name+x}" ]] && ENV_ARGS+=("$name=${!name}")
 done
 
-INIT_ARGS=(--worktree "$WORKTREE")
-for p in "${RO_PATHS[@]}"; do [[ -n "$p" ]] && INIT_ARGS+=(--ro-path "$(realpath -e "$p")"); done
+INIT_ARGS=(--worktree "$WORKTREE" --etc "$ETC_MODE")
+for m in "${RESOLVED_MOUNTS[@]}"; do INIT_ARGS+=(--mount "$m"); done
 
 rc=0
 if [[ "$BACKEND" == bwrap ]]; then
-  BWRAP=(bwrap --unshare-all --die-with-parent --new-session
-         --ro-bind /usr /usr --ro-bind /etc /etc)
+  BWRAP=(bwrap --unshare-all --die-with-parent --new-session --ro-bind /usr /usr)
+  if [[ "$ETC_MODE" == full ]]; then
+    BWRAP+=(--ro-bind /etc /etc)
+  else
+    BWRAP+=(--dir /etc)
+    for e in "${ETC_ENTRIES[@]}"; do
+      [[ -e "/etc/$e" ]] && BWRAP+=(--ro-bind "/etc/$e" "/etc/$e")
+    done
+  fi
   for p in /bin /sbin /lib /lib64 /lib32 /libx32; do
     if [[ -L "$p" ]]; then BWRAP+=(--symlink "$(readlink "$p")" "$p")
     elif [[ -d "$p" ]]; then BWRAP+=(--ro-bind "$p" "$p"); fi
   done
-  for p in "${RO_PATHS[@]}"; do [[ -n "$p" ]] && BWRAP+=(--ro-bind "$(realpath -e "$p")" "$(realpath -e "$p")"); done
   BWRAP+=(--proc /proc --dev /dev --tmpfs /tmp --tmpfs /run
           --ro-bind "$SCRIPT_DIR" /run/conductor/bin
           --bind "$STATE/egress" /run/conductor/egress
-          --bind "$WORKTREE" "$WORKTREE"
-          --remount-ro /
-          --chdir "$WORKTREE")
+          --bind "$WORKTREE" "$WORKTREE")
+  for m in "${RESOLVED_MOUNTS[@]}"; do
+    if [[ "${m%%:*}" == rw ]]; then BWRAP+=(--bind "${m#*:}" "${m#*:}")
+    else BWRAP+=(--ro-bind "${m#*:}" "${m#*:}"); fi
+  done
+  BWRAP+=(--remount-ro / --chdir "$WORKTREE")
   # Jako root dajemy init-owi tylko CAP_NET_ADMIN (regula nft w netns sandboksa)
   # i CAP_SETPCAP (zeby mogl wyczyscic bounding set). Init odbiera wszystkie
   # capabilities przed uruchomieniem mostu i komendy agenta.
@@ -136,6 +169,7 @@ else
   env -i "${ENV_ARGS[@]}" "${UNSHARE[@]}" -- \
     "$PYTHON" -I "$SCRIPT_DIR/sandbox-init.py" --backend unshare "${INIT_ARGS[@]}" \
       --newroot "$STATE/root" --bin-src "$SCRIPT_DIR" --egress-src "$STATE/egress" \
+      "${ETC_ENTRIES[@]/#/--etc-entry=}" \
       -- "$@" || rc=$?
 fi
 exit "$rc"

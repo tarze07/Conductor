@@ -4,6 +4,7 @@
 use crate::ffi;
 use crate::log::{log_debug, log_error, log_info, log_warn};
 use crate::runtime::{Agent, SpawnSpec, TtyMode};
+use crate::sandbox::{self, Sandbox, SandboxConfig};
 use crate::workspace::{self, WorkspaceManager, Worktree};
 use conductor_proto::json::Value;
 use conductor_proto::methods::*;
@@ -32,6 +33,8 @@ pub struct Config {
     pub ring_bytes: usize,
     pub stop_timeout: Duration,
     pub tty: TtyMode,
+    /// `None` = agenci bez sandboksa (wymaga jawnego `--no-sandbox`).
+    pub sandbox: Option<SandboxConfig>,
 }
 
 pub struct Run {
@@ -41,6 +44,7 @@ pub struct Run {
     pub agent_cmd: Vec<String>,
     pub worktree: Worktree,
     pub agent: Arc<Agent>,
+    pub sandboxed: bool,
 }
 
 impl Run {
@@ -60,6 +64,7 @@ impl Run {
             exit_code: exit.and_then(|e| e.code),
             signal: exit.and_then(|e| e.signal),
             output_bytes: self.agent.output_end(),
+            sandboxed: self.sandboxed,
         }
     }
 }
@@ -74,6 +79,7 @@ pub struct Daemon {
     cfg: Config,
     token: String,
     workspace: WorkspaceManager,
+    sandbox: Option<Sandbox>,
     runs: Mutex<RunTable>,
     /// Serializuje `run.start` (rezerwacja nazwy + worktree + spawn).
     start_lock: Mutex<()>,
@@ -187,6 +193,29 @@ impl Daemon {
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| io::Error::other("socket path has no parent directory"))?;
         prepare_socket_dir(dir)?;
+        let sandbox = match &cfg.sandbox {
+            Some(sc) => {
+                let sb = Sandbox::new(sc.clone(), &dir.join("state")).map_err(io::Error::other)?;
+                sb.self_test().map_err(io::Error::other)?;
+                match sb.org_rules() {
+                    Some(r) => log_info!(
+                        "sandbox: enabled ({}), organization egress allowlist: {} rule(s)",
+                        sc.launcher.display(),
+                        r.len()
+                    ),
+                    None => log_info!(
+                        "sandbox: enabled ({}), no organization egress allowlist: agents have NO network",
+                        sc.launcher.display()
+                    ),
+                }
+                log_info!("audit log: {}", sb.audit.path().display());
+                Some(sb)
+            }
+            None => {
+                log_warn!("sandbox: DISABLED (--no-sandbox): agents run with the daemon user's full privileges");
+                None
+            }
+        };
         let token = generate_token()?;
         // Token zapisujemy przed bind(), więc gdy socket przyjmuje połączenia, token już jest.
         let token_path = conductor_proto::paths::token_path(&cfg.socket);
@@ -203,6 +232,7 @@ impl Daemon {
             cfg,
             token,
             workspace,
+            sandbox,
             runs: Mutex::new(RunTable {
                 next_seq: 1,
                 ..Default::default()
@@ -512,21 +542,51 @@ impl Daemon {
                 wt.path.display().to_string(),
             ),
         ];
+        let fail = |what: String| {
+            log_warn!("{run_id}: {what}; rolling back worktree");
+            self.workspace.rollback(&wt);
+            if let Some(sb) = &self.sandbox {
+                sb.cleanup(&run_id);
+                sb.audit.event(
+                    "run.start_failed",
+                    vec![
+                        ("run_id", run_id.as_str().into()),
+                        ("error", what.as_str().into()),
+                    ],
+                );
+            }
+        };
+        let (argv, env, clear_env, prepared) = match &self.sandbox {
+            Some(sb) => {
+                let prepared = self
+                    .workspace
+                    .git_paths(&wt)
+                    .and_then(|g| sb.prepare(&run_id, &name, &wt, &g, &p.agent_cmd, &env));
+                match prepared {
+                    Ok(pr) => (pr.argv.clone(), pr.env.clone(), true, Some(pr)),
+                    Err(e) => {
+                        fail(format!("cannot prepare sandbox: {e}"));
+                        return Err(RpcError::new(
+                            code::SPAWN_ERROR,
+                            format!("cannot prepare sandbox: {e}"),
+                        ));
+                    }
+                }
+            }
+            None => (p.agent_cmd.clone(), env, false, None),
+        };
         let agent = match Agent::spawn(SpawnSpec {
-            argv: &p.agent_cmd,
+            argv: &argv,
             cwd: &wt.path,
             env,
+            clear_env,
             mode: self.cfg.tty,
             ring_bytes: self.cfg.ring_bytes,
             label: run_id.clone(),
         }) {
             Ok(a) => a,
             Err(e) => {
-                log_warn!(
-                    "{run_id}: cannot start {:?}: {e}; rolling back worktree",
-                    p.agent_cmd
-                );
-                self.workspace.rollback(&wt);
+                fail(format!("cannot start {:?}: {e}", p.agent_cmd));
                 return Err(RpcError::new(
                     code::SPAWN_ERROR,
                     format!("cannot start `{}`: {e}", p.agent_cmd[0]),
@@ -534,13 +594,50 @@ impl Daemon {
             }
         };
         log_info!(
-            "{run_id}: started {:?} as pid {} ({}) in {} on {}",
+            "{run_id}: started {:?} as pid {} ({}, {}) in {} on {}",
             p.agent_cmd,
             agent.pid,
             agent.mode.as_str(),
+            if prepared.is_some() {
+                "sandboxed"
+            } else {
+                "NOT sandboxed"
+            },
             wt.path.display(),
             wt.branch
         );
+        if let (Some(sb), Some(pr)) = (&self.sandbox, &prepared) {
+            if !pr.allowlist.dropped.is_empty() {
+                log_warn!(
+                    "{run_id}: project egress rules not covered by the organization allowlist were dropped: {:?}",
+                    pr.allowlist.dropped
+                );
+            }
+            sb.audit.event(
+                "run.start",
+                vec![
+                    ("run_id", run_id.as_str().into()),
+                    ("name", name.as_str().into()),
+                    ("task", p.task.as_str().into()),
+                    ("repo", wt.repo_root.display().to_string().into()),
+                    ("branch", wt.branch.as_str().into()),
+                    ("worktree", wt.path.display().to_string().into()),
+                    (
+                        "agent_cmd",
+                        Value::Array(p.agent_cmd.iter().map(|a| a.as_str().into()).collect()),
+                    ),
+                    ("pid", agent.pid.into()),
+                    (
+                        "egress_allowlist",
+                        sandbox::rules_value(&pr.allowlist.rules),
+                    ),
+                    (
+                        "egress_dropped",
+                        sandbox::rules_value(&pr.allowlist.dropped),
+                    ),
+                ],
+            );
+        }
         let result = RunStartResult {
             run_id: run_id.clone(),
             name: name.clone(),
@@ -554,6 +651,7 @@ impl Daemon {
             agent_cmd: p.agent_cmd,
             worktree: wt,
             agent,
+            sandboxed: prepared.is_some(),
         });
         let mut t = lock(&self.runs);
         t.runs.insert(seq, run);
@@ -569,6 +667,16 @@ impl Daemon {
             .unwrap_or(self.cfg.stop_timeout)
             .min(Duration::from_secs(60));
         let out = run.agent.stop(timeout, &run.id);
+        if let Some(sb) = &self.sandbox {
+            sb.audit.event(
+                "run.stop",
+                vec![
+                    ("run_id", run.id.as_str().into()),
+                    ("killed", out.killed.into()),
+                    ("already_exited", out.already_exited.into()),
+                ],
+            );
+        }
         Ok(RunStopResult {
             run_id: run.id.clone(),
             exit_code: out.exit.and_then(|e| e.code),
@@ -613,6 +721,16 @@ impl Daemon {
                 .map_err(|e| RpcError::new(code::GIT_ERROR, e))?;
         }
         lock(&self.runs).runs.retain(|_, r| r.id != run.id);
+        if let Some(sb) = &self.sandbox {
+            sb.cleanup(&run.id);
+            sb.audit.event(
+                "run.remove",
+                vec![
+                    ("run_id", run.id.as_str().into()),
+                    ("worktree_deleted", p.delete_worktree.into()),
+                ],
+            );
+        }
         log_info!(
             "{}: removed (worktree {})",
             run.id,

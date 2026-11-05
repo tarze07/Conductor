@@ -15,7 +15,7 @@ To jest prototyp w Pythonie i Bashu. Docelowa implementacja ma być częścią
 
 | Plik | Rola |
 |------|------|
-| `run-sandboxed.sh` | Punkt wejścia: `run-sandboxed.sh [opcje] <worktree_dir> -- <komenda>`. Startuje proxy na hoście, tworzy namespace'y, czyści środowisko, sprząta po sobie. |
+| `run-sandboxed.sh` | Punkt wejścia: `run-sandboxed.sh [opcje] <worktree_dir> -- <komenda>`. Startuje proxy na hoście, tworzy namespace'y, czyści środowisko, sprząta po sobie. Opcje `--ro`/`--rw` (montowania w kolejności, po worktree) i `--etc minimal|full`. Używany przez `conductord` (issue #14). |
 | `egress-proxy.py` | Egress Guard: proxy HTTP CONNECT na unix sockecie, allowlista `host:port`, sprawdzanie SNI, audyt JSON lines. Działa poza sandboksem. |
 | `sandbox-bridge.py` | Most wewnątrz sandboksa: `127.0.0.1:3128` (TCP) -> unix socket proxy. Nie podejmuje decyzji. |
 | `sandbox-init.py` | Pierwszy proces w sandboksie: (backend `unshare`) buduje nowy root i robi `pivot_root`, podnosi `lo`, ustawia regułę nft, rlimity, odbiera capabilities, uruchamia most i komendę. |
@@ -155,12 +155,14 @@ w Ruście będzie to pojedyncze milisekundy plus czas `clone`/mount.
 - **Brak filtra adresów po rozwiązaniu nazwy.** Nazwa z allowlisty wskazująca na
   loopback lub link-local (DNS rebinding) zostałaby połączona; ADR-002 przewiduje odrzucanie
   adresów specjalnych.
-- **Git w worktree nie działa w pełni.** Plik `.git` worktree wskazuje na
-  `<repo>/.git/worktrees/<nazwa>`, którego prototyp nie montuje, więc `git status`/`commit`
-  w sandboksie zawiodą. ADR-002 opisuje docelowy sposób montowania `.git`.
-- **Cały `/etc` jest widoczny (read-only).** Docelowo kuratorowany podzbiór
-  (`passwd`, `group`, `hosts`, `nsswitch.conf`, certyfikaty CA, `ld.so.*`, `alternatives`).
-- **Init jako PID 1 nie zbiera osieroconych procesów** (zombie żyją do końca sandboksa).
+- **Metadane git** montuje wywołujący (`--ro`/`--rw`, issue #14): `conductord` podaje
+  `.git` repo read-only i do zapisu tylko to, czego potrzebuje commit na gałęzi agenta
+  (patrz `crates/conductord/README.md`). Sam launcher bez tych opcji git nie obsłuży.
+- **Minimalny `/etc`** jest domyślny (`--etc minimal`, lista w `run-sandboxed.sh`:
+  `passwd`, `group`, `hosts`, `nsswitch.conf`, certyfikaty CA, `ld.so.*`,
+  `alternatives` i kilka innych); pełny `/etc` read-only przez `--etc full`.
+  Narzędzia czytające nietypowe pliki z `/etc` mogą tego wymagać.
+- **Init jako PID 1** (backend `unshare`) zbiera osierocone procesy; w `bwrap` robi to bwrap.
 - **Audyt nie ma łańcucha hashy** ani podpisu; to zalążek formatu, nie Audit Log z PLAN.md.
 - **Uwierzytelnienie do proxy** opiera się na tym, że socket jest w prywatnym katalogu
   sandboksa. Docelowo: osobny socket per sandbox (jak tu) plus `SO_PEERCRED` w decyzjach.

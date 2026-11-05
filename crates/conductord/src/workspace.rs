@@ -81,6 +81,15 @@ pub struct Worktree {
     pub branch: String,
 }
 
+/// Metadane git worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPaths {
+    /// `.git/worktrees/<id>`: HEAD i index worktree.
+    pub git_dir: PathBuf,
+    /// `.git` repozytorium: obiekty, refy, config, hooks.
+    pub common_dir: PathBuf,
+}
+
 pub struct WorkspaceManager {
     git_lock: Mutex<()>,
     /// Gdzie tworzyć worktree. `None` = katalog `<repo>.worktrees` obok repozytorium.
@@ -88,7 +97,9 @@ pub struct WorkspaceManager {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    crate::ffi::clear_signal_mask(&mut cmd);
+    let out = cmd
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -211,6 +222,29 @@ impl WorkspaceManager {
             let _ = std::fs::remove_dir(parent);
         }
         Ok(())
+    }
+
+    /// Absolutne ścieżki `git-common-dir` (`.git` repo) i `git-dir` worktree
+    /// (`.git/worktrees/<id>`), potrzebne do montowań w sandboksie.
+    pub fn git_paths(&self, wt: &Worktree) -> Result<GitPaths, String> {
+        let _g = self.lock();
+        let out = git(
+            &wt.path,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+        )?;
+        let mut lines = out.lines();
+        match (lines.next(), lines.next()) {
+            (Some(g), Some(c)) => Ok(GitPaths {
+                git_dir: PathBuf::from(g),
+                common_dir: PathBuf::from(c),
+            }),
+            _ => Err(format!("unexpected `git rev-parse` output: {out:?}")),
+        }
     }
 
     /// Wycofanie po nieudanym starcie: usuń worktree i świeżo utworzoną gałąź.

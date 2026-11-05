@@ -104,16 +104,26 @@ def bind(src: str, dst: str, readonly: bool, recursive: bool = True) -> None:
 
 # ------------------------------------------------------------------ system plikow
 
-def setup_fs(newroot: str, worktree: str, bin_src: str, egress_src: str, ro_paths: list[str]) -> None:
+def setup_fs(newroot: str, worktree: str, bin_src: str, egress_src: str,
+             mounts: list[tuple[str, str]], etc_mode: str, etc_entries: list[str]) -> None:
     mount(None, "/", None, MS_REC | MS_PRIVATE)
     os.makedirs(newroot, exist_ok=True)
     mount("tmpfs", newroot, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=64m")
     R = lambda p: newroot + p
 
     # Toolchain i konfiguracja systemowa: tylko do odczytu.
-    for p in ["/usr", "/etc"] + ro_paths:
-        if os.path.exists(p):
-            bind(p, R(p), readonly=True)
+    bind("/usr", R("/usr"), readonly=True)
+    if etc_mode == "full":
+        bind("/etc", R("/etc"), readonly=True)
+    else:
+        # Minimalny /etc: tylko wybrane wpisy (lista w run-sandboxed.sh).
+        os.makedirs(R("/etc"))
+        for e in etc_entries:
+            src = "/etc/" + e
+            if os.path.lexists(src) and not os.path.islink(src):
+                bind(src, R(src), readonly=True)
+            elif os.path.islink(src):
+                os.symlink(os.readlink(src), R(src))
     # Merged-/usr: /bin, /lib, ... to zwykle symlinki; odtwarzamy je.
     for p in ["/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32"]:
         if os.path.islink(p):
@@ -152,6 +162,10 @@ def setup_fs(newroot: str, worktree: str, bin_src: str, egress_src: str, ro_path
     bind(egress_src, R(EGRESS_DIR), readonly=False)
     # Worktree jako jedyne miejsce zapisu trwalego. Sciezka taka sama jak na hoscie.
     bind(worktree, R(worktree), readonly=False)
+    # Dodatkowe montowania w podanej kolejnosci (pozniejsze nadpisuja wczesniejsze),
+    # np. metadane git worktree: .git repo (ro), objects/ i refs agenta (rw), plik .git (ro).
+    for mode, path in mounts:
+        bind(path, R(path), readonly=(mode == "ro"))
 
     # Root nowego drzewa tylko do odczytu (zapisywalne zostaja tylko jawne mounty).
     mount(None, newroot, None, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV)
@@ -237,6 +251,24 @@ def set_limits() -> None:
         lower(resource.RLIMIT_NPROC, int(os.environ["SANDBOX_NPROC"]))
 
 
+# ------------------------------------------------------------------------- PID 1
+
+def wait_main(main_pid: int) -> int:
+    """Czeka na komende agenta. Jako PID 1 (backend unshare) zbiera tez osierocone
+    procesy (zombie), ktore jadro przepina na init PID namespace'u."""
+    reap_all = os.getpid() == 1
+    while True:
+        try:
+            pid, status = os.waitpid(-1 if reap_all else main_pid, 0)
+        except KeyboardInterrupt:
+            continue
+        except ChildProcessError:
+            return 125
+        if pid == main_pid:
+            return os.waitstatus_to_exitcode(status)
+        # inny proces (osierocony potomek albo most): po prostu zebrany
+
+
 # ------------------------------------------------------------------------- main
 
 def main() -> int:
@@ -246,7 +278,10 @@ def main() -> int:
     ap.add_argument("--newroot")
     ap.add_argument("--bin-src")
     ap.add_argument("--egress-src")
-    ap.add_argument("--ro-path", action="append", default=[])
+    ap.add_argument("--mount", action="append", default=[],
+                    help="ro:PATH albo rw:PATH, w kolejnosci montowania")
+    ap.add_argument("--etc", default="minimal", choices=["minimal", "full"])
+    ap.add_argument("--etc-entry", action="append", default=[])
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
@@ -254,9 +289,16 @@ def main() -> int:
         print("sandbox-init: brak komendy", file=sys.stderr)
         return 2
 
-    status = {"backend": a.backend}
+    mounts = []
+    for m in a.mount:
+        mode, _, path = m.partition(":")
+        if mode not in ("ro", "rw") or not path.startswith("/"):
+            print(f"sandbox-init: zle montowanie: {m}", file=sys.stderr)
+            return 2
+        mounts.append((mode, path))
+    status = {"backend": a.backend, "etc": a.etc}
     if a.backend == "unshare":
-        setup_fs(a.newroot, a.worktree, a.bin_src, a.egress_src, a.ro_path)
+        setup_fs(a.newroot, a.worktree, a.bin_src, a.egress_src, mounts, a.etc, a.etc_entry)
     status["loopback"] = "up" if loopback_up() else "down"
     status["nftables"] = apply_nft()
     status["interfaces"] = list_interfaces()
@@ -284,12 +326,7 @@ def main() -> int:
         print(f"sandbox-init: nie mozna uruchomic {cmd[0]}: {e}", file=sys.stderr)
         bridge.terminate()
         return 127
-    while True:
-        try:
-            rc = proc.wait()
-            break
-        except KeyboardInterrupt:
-            continue
+    rc = wait_main(proc.pid)
     bridge.terminate()
     try:
         bridge.wait(timeout=2)

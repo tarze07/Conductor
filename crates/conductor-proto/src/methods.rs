@@ -279,6 +279,8 @@ pub struct RunInfo {
     pub signal: Option<i32>,
     /// Liczba bajtów wyjścia wyprodukowanych od startu (absolutny offset końca).
     pub output_bytes: u64,
+    /// Czy agent działa w sandboksie (ADR-002). Brak pola = `false` (starsze daemony).
+    pub sandboxed: bool,
 }
 
 impl Wire for RunInfo {
@@ -302,6 +304,7 @@ impl Wire for RunInfo {
             ("exit_code", self.exit_code.map(Value::from)),
             ("signal", self.signal.map(Value::from)),
             ("output_bytes", Some(self.output_bytes.into())),
+            ("sandboxed", Some(self.sandboxed.into())),
         ])
     }
     fn from_value(v: &Value) -> Result<Self, String> {
@@ -320,6 +323,7 @@ impl Wire for RunInfo {
             exit_code: f.opt_i32("exit_code")?,
             signal: f.opt_i32("signal")?,
             output_bytes: f.u64("output_bytes")?,
+            sandboxed: f.bool_or("sandboxed", false)?,
         })
     }
 }
@@ -780,6 +784,7 @@ mod tests {
             exit_code: Some(3),
             signal: None,
             output_bytes: 12,
+            sandboxed: true,
         };
         let list = RunListResult { runs: vec![info] };
         assert_eq!(RunListResult::from_value(&list.to_value()).unwrap(), list);

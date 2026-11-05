@@ -6,11 +6,13 @@ mod ffi;
 mod log;
 mod ring;
 mod runtime;
+mod sandbox;
 mod server;
 mod workspace;
 
 use log::{log_error, log_info};
 use runtime::TtyMode;
+use sandbox::SandboxConfig;
 use server::{Config, Daemon};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,6 +31,16 @@ Opcje:
   --ring-bytes N         rozmiar bufora wyjscia na przebieg (domyslnie 1048576)
   --stop-timeout-ms N    czas miedzy SIGTERM a SIGKILL (domyslnie 5000)
   --no-pty               uruchamiaj agentow na pipe'ach zamiast w PTY
+
+Sandbox (ADR-002), wymagany domyslnie:
+  --sandbox-launcher P   launcher sandboksa (run-sandboxed.sh); domyslnie
+                         $CONDUCTOR_SANDBOX_LAUNCHER
+  --egress-allowlist F   allowlista Egress Guard organizacji; bez niej agenci
+                         nie maja sieci. Allowlista projektu
+                         (<repo>/.conductor/egress-allowlist.txt) moze ja tylko zawezic
+  --sandbox-backend B    auto | bwrap | unshare (domyslnie auto)
+  --sandbox-full-etc     pelny /etc w sandboksie zamiast minimalnego
+  --no-sandbox           uruchamiaj agentow BEZ izolacji (tylko do testow)
   -v, --verbose          logi DEBUG
   -h, --help             ta pomoc
   -V, --version          wersja daemona i protokolu
@@ -48,6 +60,11 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut stop_timeout = Duration::from_millis(5000);
     let mut tty = TtyMode::Pty;
     let mut verbose = false;
+    let mut launcher: Option<PathBuf> = None;
+    let mut allowlist: Option<PathBuf> = None;
+    let mut backend: Option<String> = None;
+    let mut full_etc = false;
+    let mut no_sandbox = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| {
@@ -73,6 +90,17 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 );
             }
             "--no-pty" => tty = TtyMode::Pipe,
+            "--sandbox-launcher" => launcher = Some(PathBuf::from(value("--sandbox-launcher")?)),
+            "--egress-allowlist" => allowlist = Some(PathBuf::from(value("--egress-allowlist")?)),
+            "--sandbox-backend" => {
+                let b = value("--sandbox-backend")?;
+                if !matches!(b.as_str(), "auto" | "bwrap" | "unshare") {
+                    return Err(format!("unknown sandbox backend `{b}`"));
+                }
+                backend = Some(b);
+            }
+            "--sandbox-full-etc" => full_etc = true,
+            "--no-sandbox" => no_sandbox = true,
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => return Ok(Cli::Help),
             "-V" | "--version" => return Ok(Cli::Version),
@@ -85,6 +113,28 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             .map_err(|e| format!("cannot determine socket path: {e}"))?,
     };
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let launcher = launcher.or_else(|| {
+        std::env::var_os("CONDUCTOR_SANDBOX_LAUNCHER")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
+    let sandbox = match (no_sandbox, launcher) {
+        (true, Some(_)) => {
+            return Err("--no-sandbox conflicts with --sandbox-launcher".into());
+        }
+        (true, None) => None,
+        (false, None) => {
+            return Err("no sandbox launcher: pass --sandbox-launcher PATH (or set \
+                 CONDUCTOR_SANDBOX_LAUNCHER), or --no-sandbox to run agents unisolated"
+                .into());
+        }
+        (false, Some(l)) => Some(SandboxConfig {
+            launcher: cwd.join(l),
+            org_allowlist: allowlist.map(|a| cwd.join(a)),
+            backend,
+            full_etc,
+        }),
+    };
     Ok(Cli::Run(
         Config {
             socket: cwd.join(socket),
@@ -92,6 +142,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             ring_bytes,
             stop_timeout,
             tty,
+            sandbox,
         },
         verbose,
     ))
@@ -176,6 +227,7 @@ mod tests {
             "--stop-timeout-ms",
             "250",
             "-v",
+            "--no-sandbox",
         ]))
         .unwrap() else {
             panic!("expected Run")
@@ -185,6 +237,41 @@ mod tests {
         assert_eq!(cfg.ring_bytes, 100);
         assert_eq!(cfg.stop_timeout, Duration::from_millis(250));
         assert!(verbose);
+        assert_eq!(cfg.sandbox, None);
+    }
+
+    #[test]
+    fn sandbox_is_required_by_default() {
+        std::env::remove_var("CONDUCTOR_SANDBOX_LAUNCHER");
+        assert!(parse_args(&args(&[])).is_err());
+        assert!(parse_args(&args(&["--no-sandbox", "--sandbox-launcher", "/x"])).is_err());
+        assert!(parse_args(&args(&[
+            "--sandbox-launcher",
+            "/x",
+            "--sandbox-backend",
+            "lxc"
+        ]))
+        .is_err());
+        let Cli::Run(cfg, _) = parse_args(&args(&[
+            "--sandbox-launcher",
+            "/opt/run-sandboxed.sh",
+            "--egress-allowlist",
+            "/etc/conductor/egress.txt",
+            "--sandbox-backend",
+            "unshare",
+        ]))
+        .unwrap() else {
+            panic!("expected Run")
+        };
+        assert_eq!(
+            cfg.sandbox,
+            Some(SandboxConfig {
+                launcher: "/opt/run-sandboxed.sh".into(),
+                org_allowlist: Some("/etc/conductor/egress.txt".into()),
+                backend: Some("unshare".into()),
+                full_etc: false,
+            })
+        );
     }
 
     #[test]

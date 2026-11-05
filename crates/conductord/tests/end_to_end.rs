@@ -46,6 +46,8 @@ impl Env {
             .arg(root.join("worktrees"))
             .arg("--stop-timeout-ms")
             .arg("2000")
+            // Ten test sprawdza IPC, worktree i runtime; sandbox: tests/sandbox.rs.
+            .arg("--no-sandbox")
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn conductord");

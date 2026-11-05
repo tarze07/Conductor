@@ -228,6 +228,23 @@ pub fn configure_pipe_child(cmd: &mut Command) {
     }
 }
 
+/// Odblokowuje sygnały w dziecku. Daemon blokuje SIGTERM/SIGINT/SIGHUP (odbiera je
+/// przez `sigwait`), a maska jest dziedziczona przez `fork`/`exec` i std jej nie czyści.
+/// Bez tego np. `kill -TERM` w skryptach launchera sandboksa nie działa.
+pub fn clear_signal_mask(cmd: &mut Command) {
+    let empty = empty_sigset();
+    // SAFETY: jak w `configure_pty_child`: tylko async-signal-safe pthread_sigmask.
+    unsafe {
+        cmd.pre_exec(move || {
+            let r = pthread_sigmask(SIG_SETMASK, &empty, std::ptr::null_mut());
+            if r != 0 {
+                return Err(io::Error::from_raw_os_error(r));
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Wysyła sygnał do całej grupy procesów. `Ok(false)`, gdy grupa już nie istnieje.
 pub fn kill_process_group(pgid: u32, sig: i32) -> io::Result<bool> {
     let pgid = pid_t::try_from(pgid).map_err(io::Error::other)?;

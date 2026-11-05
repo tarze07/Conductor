@@ -10,7 +10,7 @@ Crate'y:
 | Crate | Rola |
 |-------|------|
 | `conductor-proto` | Typy JSON-RPC 2.0, metody protokołu, własny koder/dekoder JSON, base64, synchroniczny klient. Bez `unsafe`. |
-| `conductord` | Daemon: IPC, uwierzytelnianie, Workspace Manager, Agent Runtime. `unsafe` wyłącznie w `src/ffi.rs`. |
+| `conductord` | Daemon: IPC, uwierzytelnianie, Workspace Manager, Agent Runtime, integracja sandboksa (`src/sandbox.rs`, issue #14). `unsafe` wyłącznie w `src/ffi.rs`. |
 | `conductor-cli` | Binarka `conductor`, cienki klient protokołu (UI fazy 0). Bez `unsafe`. |
 
 ## Architektura
@@ -82,6 +82,46 @@ Kody błędów: standardowe JSON-RPC oraz `-32001` (brak autoryzacji), `-32002` 
 przebieg), `-32003` (konflikt stanu), `-32004` (wersja protokołu), `-32005` (trwa
 shutdown), `-32010` (git) i `-32011` (spawn).
 
+## Sandbox agentów (issue #14)
+
+Daemon domyślnie **wymaga** sandboksa. Bez `--sandbox-launcher` (albo
+`$CONDUCTOR_SANDBOX_LAUNCHER`) nie wystartuje; uruchomienie agentów bez izolacji
+wymaga jawnego `--no-sandbox` i jest głośno logowane. Przy starcie daemon robi
+próbny sandbox (`/bin/sh -c 'echo sandbox-ok'`); jeśli namespace'y nie działają,
+daemon kończy się błędem, zamiast uruchamiać agentów bez izolacji.
+
+Każdy przebieg startuje przez launcher z `prototypes/sandbox-linux/run-sandboxed.sh`
+(ADR-002). Daemon przekazuje mu:
+
+| Co | Skąd / jak |
+|----|------------|
+| Allowlistę Egress Guard | `--egress-allowlist` (organizacja) ∩ `<repo>/.conductor/egress-allowlist.txt` (projekt, czytany z głównego checkoutu, nie z worktree agenta). Projekt może tylko zawęzić organizację (ADR-003); reguły spoza organizacji są odrzucane i logowane. Brak allowlisty organizacji = brak sieci. |
+| Montowania git | `.git` repo tylko do odczytu (config, hooks, inne gałęzie); do zapisu tylko `objects/`, katalog refów i reflogów gałęzi agenta (`refs/heads/agent/<zadanie>/`) i `.git/worktrees/<id>`; pliki `commondir`, `gitdir` i plik `.git` w worktree tylko do odczytu. `git status`/`add`/`commit` działają, a agent nie przestawi `main`, nie zmieni `config` ani nie przepnie worktree na inne repo. |
+| Środowisko | Launcher dostaje tylko `PATH` i locale; do agenta trafiają wyłącznie `CONDUCTOR_*`, autor git (`Conductor agent <nazwa> <nazwa@agents.conductor.invalid>`) i `gc.auto=0`. Sekrety ze środowiska daemona nie przechodzą. |
+| Audit log | `<katalog socketu>/state/audit.jsonl` (0600, JSON lines): zdarzenia daemona (`run.start` z efektywną i odrzuconą allowlistą, `run.stop`, `run.remove`, `run.start_failed`) oraz wpisy Egress Guard każdego sandboksa (`sandbox` = `run_id`). Łańcuch hashy: #17. |
+
+Opcje: `--sandbox-backend auto|bwrap|unshare`, `--sandbox-full-etc` (pełny `/etc`
+zamiast minimalnego). `conductor list` pokazuje kolumnę `SANDBOX`.
+
+Test `tests/sandbox.rs` (oba backendy) uruchamia agenta, który próbuje: połączenia do
+hosta z allowlisty (działa), do hosta, którego chciał projekt, a organizacja nie
+pozwala (odrzucone), bezpośredniego TCP (brak sieci), zapisu poza worktree, do
+głównego checkoutu, do `.git/config` i do pliku `.git` (bez skutku na hoście),
+przesunięcia `main` (odrzucone), commita na własnej gałęzi (działa), oraz sprawdza,
+że sekret ze środowiska daemona nie dociera do agenta, a audit log zawiera decyzje.
+
+Ograniczenia integracji:
+
+- Logika sandboksa jest w launcherze (Bash + Python), nie w Ruście; narzut ~0,3 s na start.
+- Agenci tego samego zadania (`refs/heads/agent/<zadanie>/`) mogą przestawiać sobie
+  nawzajem gałęzie, bo dzielą katalog refów.
+- Agent może zapisywać dowolne obiekty w `.git/objects` repo (nie zmienia to żadnej
+  gałęzi poza jego własną).
+- Backend `bwrap` tworzy nową sesję, więc `conductor stop` nie dostarcza agentowi
+  łagodnego SIGTERM: sandbox jest zabijany w całości. W backendzie `unshare` agent
+  dostaje SIGTERM.
+- Brak seccomp i cgroups (#15), DNS, proxy nadrzędnego i kontroli `git push` (#16).
+
 ## Demo: 3 agentów w 3 worktree
 
 ```sh
@@ -89,7 +129,9 @@ cargo build                      # w sandboksie bez sieci: RUSTUP_TOOLCHAIN=stab
 export PATH="$PWD/target/debug:$PATH"
 export CONDUCTOR_SOCKET=/tmp/conductor-demo/conductord.sock
 
-conductord 2>/tmp/conductor-demo.log &       # daemon na pierwszym planie, logi na stderr
+# Sandbox (domyślnie wymagany); bez allowlisty organizacji agenci nie mają sieci.
+conductord --sandbox-launcher "$PWD/prototypes/sandbox-linux/run-sandboxed.sh" \
+  2>/tmp/conductor-demo.log &    # logi na stderr; --no-sandbox tylko do testów
 
 # Repozytorium testowe
 mkdir -p /tmp/demo-repo && cd /tmp/demo-repo && git init -q -b main
@@ -165,7 +207,8 @@ Każdy krok to osobny PR, który przechodzi ten sam zestaw testów.
 
 ## Znane braki (TODO)
 
-- Brak sandboksa (ADR-002) i Policy Engine. Agent ma pełne prawa użytkownika daemona.
+- Brak Policy Engine (#20): zgody człowieka i polityki komend nie są egzekwowane.
+- Sandbox: patrz ograniczenia w sekcji „Sandbox agentów”.
 - Stan przebiegów żyje tylko w pamięci. Po restarcie daemona przebiegi znikają, a
   worktree i gałęzie zostają na dysku.
 - Brak subskrypcji i zdarzeń (pub/sub). `run.output` to long-poll.
