@@ -39,6 +39,92 @@ pub struct SandboxConfig {
     pub backend: Option<String>,
     /// Pełny `/etc` zamiast minimalnego.
     pub full_etc: bool,
+    /// Limity zasobów cgroup v2 (issue #15).
+    pub limits: Limits,
+}
+
+// --- limity zasobów (cgroup v2, issue #15) ---------------------------------------
+
+/// Limity per przebieg przekazywane launcherowi (`--cgroups`, `--pids-max` itd.).
+/// Wartości w formacie plików cgroup v2; `max` = bez limitu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    /// `required` | `best-effort` | `off`.
+    pub cgroups: String,
+    pub pids_max: String,
+    pub memory_max: String,
+    pub memory_swap_max: String,
+    /// `cpu.max`: `"QUOTA PERIOD"` albo `max`.
+    pub cpu_max: String,
+}
+
+impl Default for Limits {
+    /// Domyślne wartości daemona: dość dla buildów (cargo, gradle), a fork bomba
+    /// albo wyciek pamięci jednego agenta nie położy stacji ani pozostałych agentów.
+    fn default() -> Limits {
+        Limits {
+            cgroups: "best-effort".into(),
+            pids_max: "4096".into(),
+            memory_max: "8G".into(),
+            memory_swap_max: "0".into(),
+            cpu_max: "max".into(),
+        }
+    }
+}
+
+fn valid_size(v: &str) -> bool {
+    let digits = v.strip_suffix(['K', 'M', 'G', 'T']).unwrap_or(v);
+    v == "max" || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn valid_number(v: &str) -> bool {
+    v == "max" || (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+}
+
+impl Limits {
+    /// Ustawia opcję `--sandbox-<name>` (bez prefiksu); błąd przy złej wartości.
+    pub fn set(&mut self, name: &str, v: String) -> Result<(), String> {
+        let ok = match name {
+            "cgroups" => matches!(v.as_str(), "required" | "best-effort" | "off"),
+            "pids-max" => valid_number(&v),
+            "memory-max" | "memory-swap-max" => valid_size(&v),
+            "cpu-max" => {
+                let mut it = v.split(' ');
+                let quota = it.next().unwrap_or_default();
+                let period = it.next();
+                valid_number(quota)
+                    && period.is_none_or(|p| p != "max" && valid_number(p))
+                    && it.next().is_none()
+            }
+            _ => return Err(format!("unknown sandbox limit `{name}`")),
+        };
+        if !ok {
+            return Err(format!("invalid value for --sandbox-{name}: `{v}`"));
+        }
+        let slot = match name {
+            "cgroups" => &mut self.cgroups,
+            "pids-max" => &mut self.pids_max,
+            "memory-max" => &mut self.memory_max,
+            "memory-swap-max" => &mut self.memory_swap_max,
+            _ => &mut self.cpu_max,
+        };
+        *slot = v;
+        Ok(())
+    }
+
+    /// Argumenty launchera.
+    pub fn args(&self) -> Vec<String> {
+        [
+            ("--cgroups", &self.cgroups),
+            ("--pids-max", &self.pids_max),
+            ("--memory-max", &self.memory_max),
+            ("--memory-swap-max", &self.memory_swap_max),
+            ("--cpu-max", &self.cpu_max),
+        ]
+        .into_iter()
+        .flat_map(|(k, v)| [k.to_owned(), v.clone()])
+        .collect()
+    }
 }
 
 // --- allowlista -----------------------------------------------------------------
@@ -402,6 +488,7 @@ impl Sandbox {
         if let Some(b) = &self.cfg.backend {
             argv.extend(["--backend".into(), b.clone()]);
         }
+        argv.extend(self.cfg.limits.args());
         for (k, _) in &inner {
             argv.extend(["--pass-env".into(), k.clone()]);
         }
@@ -448,6 +535,7 @@ impl Sandbox {
         if let Some(b) = &self.cfg.backend {
             cmd.args(["--backend", b]);
         }
+        cmd.args(self.cfg.limits.args());
         let out = cmd
             .arg(&wt)
             .args(["--", "/bin/sh", "-c", "echo sandbox-ok"])
@@ -457,6 +545,7 @@ impl Sandbox {
         let _ = fs::remove_dir_all(&dir);
         let stdout = String::from_utf8_lossy(&out.stdout);
         if out.status.success() && stdout.trim() == "sandbox-ok" {
+            log_self_test_warnings(&String::from_utf8_lossy(&out.stderr));
             Ok(())
         } else {
             Err(format!(
@@ -468,9 +557,61 @@ impl Sandbox {
     }
 }
 
+/// Ostrzeżenia launchera z próbnego sandboksa (np. cgroup v2 niedostępne przy
+/// `--sandbox-cgroups best-effort`) trafiają do logu daemona przy starcie.
+fn log_self_test_warnings(stderr: &str) {
+    for line in stderr.lines().filter(|l| l.starts_with("sandbox:")) {
+        crate::log::log_warn!("sandbox self-test: {line}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_validation_and_args() {
+        let mut l = Limits::default();
+        assert_eq!(
+            l.args(),
+            [
+                "--cgroups",
+                "best-effort",
+                "--pids-max",
+                "4096",
+                "--memory-max",
+                "8G",
+                "--memory-swap-max",
+                "0",
+                "--cpu-max",
+                "max"
+            ]
+        );
+        for (k, v) in [
+            ("cgroups", "required"),
+            ("pids-max", "64"),
+            ("memory-max", "512M"),
+            ("memory-swap-max", "max"),
+            ("cpu-max", "200000 100000"),
+        ] {
+            l.set(k, v.into()).unwrap();
+        }
+        assert_eq!(l.cpu_max, "200000 100000");
+        assert_eq!(l.cgroups, "required");
+        for (k, v) in [
+            ("cgroups", "maybe"),
+            ("pids-max", "-1"),
+            ("pids-max", ""),
+            ("memory-max", "1.5G"),
+            ("memory-max", "G"),
+            ("cpu-max", "100000 max"),
+            ("cpu-max", "1 2 3"),
+            ("cpu-max", "2 CPU"),
+            ("bogus", "1"),
+        ] {
+            assert!(l.set(k, v.into()).is_err(), "{k}={v}");
+        }
+    }
 
     fn r(host: &str, port: u16, plaintext: bool) -> Rule {
         Rule {

@@ -201,3 +201,4 @@ fi
 echo
 echo "Wynik: $PASS PASS, $FAIL FAIL"
 [[ $FAIL -eq 0 ]]
+bash "$DIR/test-hardening.sh" && [[ $FAIL -eq 0 ]]   # seccomp i cgroups (issue #15); kod wyjscia: oba zestawy

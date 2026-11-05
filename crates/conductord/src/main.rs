@@ -12,7 +12,7 @@ mod workspace;
 
 use log::{log_error, log_info};
 use runtime::TtyMode;
-use sandbox::SandboxConfig;
+use sandbox::{Limits, SandboxConfig};
 use server::{Config, Daemon};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,12 +40,20 @@ Sandbox (ADR-002), wymagany domyslnie:
                          (<repo>/.conductor/egress-allowlist.txt) moze ja tylko zawezic
   --sandbox-backend B    auto | bwrap | unshare (domyslnie auto)
   --sandbox-full-etc     pelny /etc w sandboksie zamiast minimalnego
+  --sandbox-cgroups M    required | best-effort | off: limity cgroup v2 per agent
+                         (domyslnie best-effort: ostrzezenie, gdy niedostepne)
+  --sandbox-pids-max N   pids.max (domyslnie 4096; max = bez limitu)
+  --sandbox-memory-max S memory.max (domyslnie 8G)
+  --sandbox-memory-swap-max S  memory.swap.max (domyslnie 0)
+  --sandbox-cpu-max \"Q P\" cpu.max, np. \"200000 100000\" = 2 CPU (domyslnie max)
   --no-sandbox           uruchamiaj agentow BEZ izolacji (tylko do testow)
   -v, --verbose          logi DEBUG
   -h, --help             ta pomoc
   -V, --version          wersja daemona i protokolu
 ";
 
+// Tworzony raz przy starcie; rozmiar wariantu `Run` (Config z limitami sandboksa) nie ma znaczenia.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 enum Cli {
     Run(Config, bool),
@@ -64,6 +72,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut allowlist: Option<PathBuf> = None;
     let mut backend: Option<String> = None;
     let mut full_etc = false;
+    let mut limits = Limits::default();
     let mut no_sandbox = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -100,6 +109,14 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 backend = Some(b);
             }
             "--sandbox-full-etc" => full_etc = true,
+            opt @ ("--sandbox-cgroups"
+            | "--sandbox-pids-max"
+            | "--sandbox-memory-max"
+            | "--sandbox-memory-swap-max"
+            | "--sandbox-cpu-max") => {
+                let v = value(opt)?;
+                limits.set(&opt["--sandbox-".len()..], v)?;
+            }
             "--no-sandbox" => no_sandbox = true,
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => return Ok(Cli::Help),
@@ -133,6 +150,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             org_allowlist: allowlist.map(|a| cwd.join(a)),
             backend,
             full_etc,
+            limits,
         }),
     };
     Ok(Cli::Run(
@@ -270,8 +288,47 @@ mod tests {
                 org_allowlist: Some("/etc/conductor/egress.txt".into()),
                 backend: Some("unshare".into()),
                 full_etc: false,
+                limits: Limits::default(),
             })
         );
+    }
+
+    #[test]
+    fn parses_sandbox_limits() {
+        let Cli::Run(cfg, _) = parse_args(&args(&[
+            "--sandbox-launcher",
+            "/opt/run-sandboxed.sh",
+            "--sandbox-cgroups",
+            "required",
+            "--sandbox-pids-max",
+            "256",
+            "--sandbox-memory-max",
+            "2G",
+            "--sandbox-cpu-max",
+            "100000 100000",
+        ]))
+        .unwrap() else {
+            panic!("expected Run")
+        };
+        let l = cfg.sandbox.unwrap().limits;
+        assert_eq!(
+            (
+                l.cgroups.as_str(),
+                l.pids_max.as_str(),
+                l.memory_max.as_str()
+            ),
+            ("required", "256", "2G")
+        );
+        assert_eq!(l.cpu_max, "100000 100000");
+        assert_eq!(l.memory_swap_max, "0");
+        assert!(parse_args(&args(&[
+            "--sandbox-launcher",
+            "/x",
+            "--sandbox-cgroups",
+            "sometimes"
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&["--sandbox-launcher", "/x", "--sandbox-pids-max"])).is_err());
     }
 
     #[test]

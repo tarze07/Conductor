@@ -141,12 +141,13 @@ Egress Guard:
 - **Procesy i syscalle**: komenda agenta startuje z pustym zbiorem capabilities
   (także bounding set), `no_new_privs`, w osobnym PID namespace (pierwszy proces jest
   initem sandboksa, jego śmierć kończy wszystkie procesy agenta). Filtr **seccomp**
-  (allowlista z akcją `EPERM` dla reszty) blokuje m.in.: `socket()` dla `AF_VSOCK`,
-  `AF_PACKET`, `AF_NETLINK` (poza `NETLINK_ROUTE` tylko do odczytu), `unshare`/`clone`
-  z `CLONE_NEWUSER`, `mount`, `pivot_root`, `bpf`, `perf_event_open`, `keyctl`,
-  `add_key`, `io_uring_*`, `ptrace` (z wyjątkiem trybu debugowania włączanego polityką),
-  `kexec_*`, `init_module`. Limity przez **cgroup v2** z delegacją systemd
-  (`pids.max`, `memory.max`, `cpu.max` per agent) oraz rlimity jako warstwa zapasowa.
+  (denylista z akcją `EPERM`, domyślnie ALLOW; uzasadnienie w sekcji „Seccomp i cgroups”
+  niżej) blokuje m.in.: `socket()` dla rodzin innych niż `AF_UNIX`/`AF_INET`/`AF_INET6`
+  (w tym `AF_VSOCK`, `AF_PACKET`, `AF_NETLINK`), `unshare`/`setns`/`clone` z `CLONE_NEW*`,
+  `mount`, `pivot_root`, `bpf`, `perf_event_open`, `keyctl`, `add_key`, `io_uring_*`,
+  `ptrace` (z wyjątkiem trybu debugowania włączanego polityką), `kexec_*`, `init_module`;
+  inna architektura (ABI) niż natywna kończy proces. Limity przez **cgroup v2** z delegacją
+  systemd (`pids.max`, `memory.max`, `cpu.max` per agent) oraz rlimity jako warstwa zapasowa.
 - **Rootless Podman** zostaje backendem opcjonalnym dla zespołów, które chcą toolchainu
   z obrazu (powtarzalność buildów), z wymuszonym `--network none` i tym samym Egress Guardem.
   Nie jest domyślny, bo wymaga konfiguracji `subuid/subgid` przez administratora,
@@ -238,8 +239,60 @@ jako root i jako uid 65534 (bez sudo): dozwolone połączenie przez proxy dział
 host spoza allowlisty, literał IP, niezgodne SNI i metoda inna niż CONNECT są
 odrzucane i logowane; nie działa ominięcie proxy przez IPv4, IPv6, loopback hosta ani
 DNS; zapis poza worktree nie trafia na hosta; sekrety ze środowiska i socket ssh-agent
-nie są widoczne; host zostaje bez zmian. Prototyp nie ma seccomp ani cgroups
-(opis w README prototypu).
+nie są widoczne; host zostaje bez zmian. Seccomp i cgroups (issue #15) opisuje sekcja niżej.
+
+### Seccomp i cgroups (issue #15)
+
+**Seccomp: denylista, nie allowlista.** ADR pierwotnie zakładał allowlistę. Prototyp
+używa denylisty, bo agent uruchamia dowolne toolchainy dewelopera (kompilatory, JVM,
+Node, przeglądarki testowe), a allowlista wymagałaby pełnej wiedzy o ich syscallach i
+psułaby się przy aktualizacjach glibc i jądra (np. `clone3`, `rseq`, `statx`). Awarie
+buildów z powodu filtra prowadzą do wyłączania sandboksa, co jest gorsze niż węższy
+filtr. Granicą bezpieczeństwa pozostają namespace'y, zero capabilities, `no_new_privs` i
+Egress Guard; seccomp zamyka znane, ryzykowne i rzadko potrzebne interfejsy jądra,
+podobnie jak domyślny profil Dockera i Podmana. Wariant allowlisty zostaje opcją na
+później (np. tryb „strict” dla agentów bez buildów), gdy będziemy mieli dane z audytu.
+
+Prototyp (`prototypes/sandbox-linux/sandbox-init.py`): program BPF budowany ręcznie
+(ctypes, bez libseccomp), instalowany przez `prctl(PR_SET_SECCOMP)` po `no_new_privs`,
+tuż przed `exec` mostu i komendy agenta, w obu backendach. Reguły: sprawdzenie
+`AUDIT_ARCH_X86_64`/`AUDIT_ARCH_AARCH64` (inna ABI, np. i386 przez `int 0x80`, zabija
+proces), odrzucenie ABI x32, `EPERM` dla: `ptrace`, `process_vm_readv/writev`,
+`pidfd_getfd`, `bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `add_key`,
+`request_key`, `kexec_*`, `init_module`, `finit_module`, `delete_module`, `mount`,
+`umount2`, `pivot_root`, nowego mount API (`move_mount`, `open_tree`, `fsopen`,
+`fsconfig`, `fsmount`, `fspick`, `mount_setattr`), `unshare`, `setns`, `clone` z
+`CLONE_NEW*` (filtr argumentu), `io_uring_*`, `swapon`/`swapoff`, `reboot`, `acct`,
+`quotactl`, `quotactl_fd`, `name_to_handle_at`/`open_by_handle_at`, `syslog`,
+`iopl`/`ioperm`/`uselib` (x86_64), `personality` poza bezpiecznymi wartościami i
+`socket` poza `AF_UNIX`/`AF_INET`/`AF_INET6`; `clone3` dostaje `ENOSYS` (BPF nie widzi
+flag w `clone_args`, a glibc spada wtedy na `clone`). Numery syscalli pochodzą z
+nagłówków UAPI 6.8 i są sprawdzane w teście. Ryzyka denylisty: syscalle nowsze niż
+tabela są przepuszczane (wymaga to aktualizacji tabeli przy nowych jądrach), reszta
+jądra (systemy plików, stos sieciowy, `ioctl`) pozostaje dostępna, `strace`/`gdb` nie
+działają do czasu trybu debugowania z polityki. NETLINK jest zablokowany w całości (a nie
+„`NETLINK_ROUTE` tylko do odczytu”, jak zakładał ADR), bo seccomp nie odróżni odczytu od
+zapisu; glibc radzi sobie bez netlinku (`getaddrinfo` z `AI_ADDRCONFIG`), `ip` nie działa.
+
+**cgroup v2.** Launcher tworzy podgrupę per przebieg w zapisywalnej, delegowanej
+hierarchii cgroup v2 (root w korzeniu hierarchii albo `systemd-run --user --scope -p
+Delegate=yes`), ustawia `pids.max`, `memory.max`, `memory.swap.max`, `cpu.max`,
+przenosi do niej proces sandboksa przed `exec` (launcher i Egress Guard zostają poza nią),
+a po zakończeniu raportuje zdarzenia limitów, robi `cgroup.kill` i usuwa podgrupę.
+Gdy cgroup v2 nie jest dostępne, decyduje polityka `--cgroups required|best-effort|off`
+(domyślnie `best-effort`: ostrzeżenie i wpis w `sandbox-status.json`). `conductord`
+przekazuje swoje domyślne limity (`pids.max=4096`, `memory.max=8G`, swap 0, CPU bez
+limitu), zmieniane opcjami `--sandbox-*`. `RLIMIT_NPROC` zostaje jako opcja, ale
+limit procesów zapewnia `pids.max` (rlimit liczy procesy uid na całym hoście). W
+kontenerze deweloperskim kontrolery `pids`/`memory`/`cpu` są przypięte do cgroup v1
+(cgroup2 tylko z `hugetlb`), więc zweryfikowano polityki i cykl życia podgrupy, ale nie
+egzekwowanie limitów (fork bomb, OOM); te testy są w `test-hardening.sh` i czekają na
+host z cgroup v2.
+
+**Ubuntu 24.04+.** Bez roota launcher sprawdza, czy user namespaces działają, i przy
+blokadzie (np. `kernel.apparmor_restrict_unprivileged_userns=1`) kończy się czytelnym
+komunikatem; przykładowy profil AppArmor dla bubblewrapa jest w
+`prototypes/sandbox-linux/apparmor/` (nieinstalowany, nietestowany na Ubuntu).
 
 ## Konsekwencje
 

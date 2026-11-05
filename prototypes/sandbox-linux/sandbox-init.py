@@ -13,7 +13,8 @@ Uruchamiany przez run-sandboxed.sh juz WEWNATRZ nowych namespace'ow
      instaluje regule nftables: wyjscie tylko przez lo (defense in depth),
   3. ustawia limity zasobow (rlimit),
   4. uruchamia sandbox-bridge.py (127.0.0.1:3128 -> unix socket proxy),
-  5. uruchamia komende agenta BEZ zadnych capabilities i z no_new_privs,
+  5. uruchamia komende agenta BEZ zadnych capabilities, z no_new_privs
+     i filtrem seccomp (denylista, patrz sekcja "seccomp"),
      czeka na nia i zwraca jej kod wyjscia (konczac PID ns zabija reszte).
 """
 
@@ -238,6 +239,9 @@ def drop_privileges() -> None:
         os._exit(126)
     if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
         os._exit(126)
+    if apply_seccomp() != 0:  # filtr seccomp (issue #15): zawsze po no_new_privs
+        os.write(2, b"sandbox-init: nie mozna zainstalowac filtra seccomp\n")
+        os._exit(126)
 
 
 def set_limits() -> None:
@@ -249,6 +253,177 @@ def set_limits() -> None:
     lower(resource.RLIMIT_NOFILE, int(os.environ.get("SANDBOX_NOFILE", "4096")))
     if os.environ.get("SANDBOX_NPROC"):
         lower(resource.RLIMIT_NPROC, int(os.environ["SANDBOX_NPROC"]))
+
+
+# ---------------------------------------------------------------------- seccomp
+#
+# Filtr seccomp-bpf (issue #15) instalowany w procesie potomnym tuz przed exec mostu
+# i komendy agenta, po no_new_privs. Model: denylista (domyslnie ALLOW), bo agent
+# uruchamia dowolne toolchainy (kompilatory, JVM, node, przegladarki testowe), ktorych
+# zbioru syscalli nie znamy z gory; allowlista lamalaby je przy kazdej nowej wersji
+# libc/jadra. Blokujemy syscalle, ktore daja nowa powierzchnie ataku na jadro albo
+# omijaja izolacje (namespace'y, mounty, debugowanie innych procesow, BPF, keyring,
+# io_uring, rodziny socketow poza IP i unix). Pelne uzasadnienie: ADR-002 i README.
+#
+# Numery syscalli z naglowkow jadra 6.8 (Linux UAPI): x86_64 z asm/unistd_64.h,
+# aarch64 z asm-generic/unistd.h. test-hardening.sh porownuje je z naglowkami.
+
+SECCOMP_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}  # AUDIT_ARCH_*
+X32_SYSCALL_BIT = 0x40000000
+
+# Syscalle odrzucane bezwarunkowo z EPERM.
+SECCOMP_DENY = {
+    "x86_64": {
+        "ptrace": 101, "process_vm_readv": 310, "process_vm_writev": 311, "pidfd_getfd": 438,
+        "bpf": 321, "perf_event_open": 298, "userfaultfd": 323,
+        "keyctl": 250, "add_key": 248, "request_key": 249,
+        "kexec_load": 246, "kexec_file_load": 320,
+        "init_module": 175, "finit_module": 313, "delete_module": 176,
+        "mount": 165, "umount2": 166, "pivot_root": 155, "move_mount": 429, "open_tree": 428,
+        "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433, "mount_setattr": 442,
+        "unshare": 272, "setns": 308,
+        "io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
+        "swapon": 167, "swapoff": 168, "reboot": 169, "acct": 163,
+        "quotactl": 179, "quotactl_fd": 443,
+        "name_to_handle_at": 303, "open_by_handle_at": 304,
+        "syslog": 103, "iopl": 172, "ioperm": 173, "uselib": 134,
+    },
+    "aarch64": {
+        "ptrace": 117, "process_vm_readv": 270, "process_vm_writev": 271, "pidfd_getfd": 438,
+        "bpf": 280, "perf_event_open": 241, "userfaultfd": 282,
+        "keyctl": 219, "add_key": 217, "request_key": 218,
+        "kexec_load": 104, "kexec_file_load": 294,
+        "init_module": 105, "finit_module": 273, "delete_module": 106,
+        "mount": 40, "umount2": 39, "pivot_root": 41, "move_mount": 429, "open_tree": 428,
+        "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433, "mount_setattr": 442,
+        "unshare": 97, "setns": 268,
+        "io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
+        "swapon": 224, "swapoff": 225, "reboot": 142, "acct": 89,
+        "quotactl": 60, "quotactl_fd": 443,
+        "name_to_handle_at": 264, "open_by_handle_at": 265,
+        "syslog": 116,
+    },
+}
+# Syscalle filtrowane po argumencie albo z innym errno.
+SECCOMP_SPECIAL = {
+    "x86_64": {"clone": 56, "clone3": 435, "socket": 41, "personality": 135},
+    "aarch64": {"clone": 220, "clone3": 435, "socket": 198, "personality": 92},
+}
+# clone(): wszystkie flagi CLONE_NEW* mieszczace sie w fladze clone() (bez CLONE_NEWTIME,
+# ktora koliduje z CSIGNAL i jest dostepna tylko przez unshare/clone3, oba zablokowane).
+CLONE_NEW_MASK = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000
+SOCKET_FAMILIES_ALLOWED = (1, 2, 10)  # AF_UNIX, AF_INET, AF_INET6
+# personality(): PER_LINUX, PER_LINUX32, UNAME26, UNAME26|PER_LINUX32, zapytanie (0xffffffff).
+# Odrzucane m.in. ADDR_NO_RANDOMIZE (wylaczenie ASLR) i READ_IMPLIES_EXEC.
+PERSONALITY_ALLOWED = (0x0, 0x8, 0x20000, 0x20008, 0xFFFFFFFF)
+
+SECCOMP_RET_KILL_PROCESS = 0x80000000
+SECCOMP_RET_ERRNO = 0x00050000
+SECCOMP_RET_ALLOW = 0x7FFF0000
+EPERM, ENOSYS = 1, 38
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
+# Klasyczne BPF: ld w abs, jeq k, jge k, jset k, ret k
+BPF_LD_W_ABS, BPF_JEQ_K, BPF_JGE_K, BPF_JSET_K, BPF_RET_K = 0x20, 0x15, 0x35, 0x45, 0x06
+SECCOMP_DATA_NR, SECCOMP_DATA_ARCH, SECCOMP_DATA_ARG0_LO = 0, 4, 16  # little-endian
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+
+def build_seccomp_filter(machine: str) -> list[tuple[int, int, int, int]]:
+    """Zwraca program BPF jako liste (code, jt, jf, k). Skoki do etykiet sa
+    rozwiazywane na koncu (jt/jf to przesuniecia wzgledne, max 255)."""
+    if machine not in SECCOMP_ARCH:
+        raise SystemExit(f"seccomp: nieobslugiwana architektura: {machine}")
+    special = SECCOMP_SPECIAL[machine]
+    prog: list[list] = []      # [code, jt, jf, k]; jt/jf: int albo nazwa etykiety
+    labels: dict[str, int] = {}
+
+    def op(code, k=0, jt=0, jf=0):
+        prog.append([code, jt, jf, k])
+
+    def label(name):
+        labels[name] = len(prog)
+
+    op(BPF_LD_W_ABS, SECCOMP_DATA_ARCH)
+    op(BPF_JEQ_K, SECCOMP_ARCH[machine], jt=0, jf="kill")   # inna ABI (np. i386 przez int 0x80)
+    op(BPF_LD_W_ABS, SECCOMP_DATA_NR)
+    if machine == "x86_64":
+        op(BPF_JGE_K, X32_SYSCALL_BIT, jt="eperm", jf=0)    # ABI x32
+    for nr in sorted(SECCOMP_DENY[machine].values()):
+        op(BPF_JEQ_K, nr, jt="eperm", jf=0)
+    op(BPF_JEQ_K, special["clone3"], jt="enosys", jf=0)     # libc spada na clone()
+    op(BPF_JEQ_K, special["clone"], jt="clone", jf=0)
+    op(BPF_JEQ_K, special["socket"], jt="socket", jf=0)
+    op(BPF_JEQ_K, special["personality"], jt="personality", jf=0)
+    op(BPF_RET_K, SECCOMP_RET_ALLOW)
+
+    label("clone")
+    op(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_LO)
+    op(BPF_JSET_K, CLONE_NEW_MASK, jt="eperm", jf="allow")
+    label("socket")
+    op(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_LO)                  # int domain: jadro bierze 32 bity
+    for fam in SOCKET_FAMILIES_ALLOWED:
+        op(BPF_JEQ_K, fam, jt="allow", jf=0)
+    op(BPF_RET_K, SECCOMP_RET_ERRNO | EPERM)
+    label("personality")
+    op(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_LO)                  # unsigned int persona
+    for p in PERSONALITY_ALLOWED:
+        op(BPF_JEQ_K, p, jt="allow", jf=0)
+    op(BPF_RET_K, SECCOMP_RET_ERRNO | EPERM)
+
+    label("allow")
+    op(BPF_RET_K, SECCOMP_RET_ALLOW)
+    label("eperm")
+    op(BPF_RET_K, SECCOMP_RET_ERRNO | EPERM)
+    label("enosys")
+    op(BPF_RET_K, SECCOMP_RET_ERRNO | ENOSYS)
+    label("kill")
+    op(BPF_RET_K, SECCOMP_RET_KILL_PROCESS)
+
+    out = []
+    for i, (code, jt, jf, k) in enumerate(prog):
+        jt = labels[jt] - i - 1 if isinstance(jt, str) else jt
+        jf = labels[jf] - i - 1 if isinstance(jf, str) else jf
+        if not (0 <= jt <= 255 and 0 <= jf <= 255):
+            raise SystemExit("seccomp: skok poza zakresem BPF")
+        out.append((code, jt, jf, k))
+    return out
+
+
+SECCOMP_FILTER = None  # (bufor, sock_fprog) przygotowane przed fork, uzywane w preexec_fn
+
+
+def prepare_seccomp(machine: str | None = None) -> dict:
+    """Buduje filtr dla biezacej architektury; zwraca opis do sandbox-status.json."""
+    global SECCOMP_FILTER
+    machine = machine or platform.machine()
+    prog = build_seccomp_filter(machine)
+    buf = ctypes.create_string_buffer(b"".join(struct.pack("=HBBI", *ins) for ins in prog))
+    SECCOMP_FILTER = (buf, _SockFprog(len(prog), ctypes.addressof(buf)))
+    return {"mode": "denylist", "arch": machine, "instructions": len(prog),
+            "denied_syscalls": sorted(SECCOMP_DENY[machine]),
+            "filtered": ["clone(CLONE_NEW*)", "clone3(ENOSYS)", "socket(family)",
+                         "personality(persona)"]}
+
+
+def apply_seccomp() -> int:
+    """Instaluje przygotowany filtr w biezacym procesie (wymaga no_new_privs). 0 = OK."""
+    if SECCOMP_FILTER is None:
+        return -1
+    return libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER,
+                      ctypes.c_void_p(ctypes.addressof(SECCOMP_FILTER[1])), 0, 0)
+
+
+def hardening_status(cgroup_status: str | None) -> dict:
+    """Przygotowuje seccomp i zwraca wpisy "seccomp" i "cgroups" do sandbox-status.json."""
+    try:
+        cgroups = json.loads(cgroup_status) if cgroup_status else {"status": "unknown"}
+    except ValueError:
+        cgroups = {"status": "unknown", "raw": cgroup_status}
+    return {"seccomp": prepare_seccomp(), "cgroups": cgroups}
 
 
 # ------------------------------------------------------------------------- PID 1
@@ -282,6 +457,7 @@ def main() -> int:
                     help="ro:PATH albo rw:PATH, w kolejnosci montowania")
     ap.add_argument("--etc", default="minimal", choices=["minimal", "full"])
     ap.add_argument("--etc-entry", action="append", default=[])
+    ap.add_argument("--cgroup-status", help="JSON ze stanem cgroup od launchera")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
@@ -302,6 +478,7 @@ def main() -> int:
     status["loopback"] = "up" if loopback_up() else "down"
     status["nftables"] = apply_nft()
     status["interfaces"] = list_interfaces()
+    status.update(hardening_status(a.cgroup_status))
     os.makedirs(RUN_DIR, exist_ok=True)
     with open(STATUS_FILE, "w") as f:
         json.dump(status, f)

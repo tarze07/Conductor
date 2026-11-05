@@ -399,3 +399,82 @@ fn daemon_refuses_to_start_without_sandbox_choice() {
     assert!(!root.join("s.sock").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Agent (issue #15) próbuje zagnieżdżonego user namespace i socketów spoza IP/unix;
+/// filtr seccomp ma je odrzucić z EPERM, a zwykłe operacje (fork, wątki, AF_INET) działać.
+const HARDENING_AGENT: &str = r#"
+import ctypes, json, os, socket, subprocess, threading
+libc = ctypes.CDLL(None, use_errno=True)
+r = libc.unshare(0x10000000)  # CLONE_NEWUSER
+print("UNSHARE_EPERM" if r != 0 and ctypes.get_errno() == 1 else f"UNSHARE_RESULT {r} {ctypes.get_errno()}")
+r = subprocess.run(["unshare", "-U", "true"], capture_output=True, text=True)
+print("UNSHARE_CLI_BLOCKED" if r.returncode != 0 else "UNSHARE_CLI_OK")
+for fam, name in [(socket.AF_NETLINK, "NETLINK"), (socket.AF_PACKET, "PACKET"), (40, "VSOCK")]:
+    try:
+        socket.socket(fam, socket.SOCK_RAW if fam != 40 else socket.SOCK_STREAM, 0); print(name + "_OPEN")
+    except OSError as e:
+        print(name + ("_EPERM" if e.errno == 1 else f"_ERRNO_{e.errno}"))
+socket.socket(socket.AF_INET, socket.SOCK_STREAM).close(); print("INET_OK")
+t = threading.Thread(target=lambda: None); t.start(); t.join()
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+os.waitpid(pid, 0); print("FORK_THREAD_OK")
+print("SECCOMP=" + [l.split()[1] for l in open("/proc/self/status") if l.startswith("Seccomp:")][0])
+st = json.load(open("/run/conductor/sandbox-status.json"))
+print("STATUS_SECCOMP=" + st["seccomp"]["mode"])
+print("STATUS_CGROUPS=" + st["cgroups"]["status"] + " pids.max=" + st["cgroups"]["limits"].get("pids.max", "-"))
+"#;
+
+fn hardening_scenario(backend: &str) {
+    let port = gateway();
+    let (root, repo) = setup(port);
+    let env = start_daemon(&root, &repo, backend);
+    let (mut c, _) = Client::connect_authenticated(&env.socket).unwrap();
+    let started = c
+        .run_start(RunStartParams {
+            repo: env.repo.display().to_string(),
+            task: "hardening".into(),
+            agent_cmd: vec!["python3".into(), "-c".into(), HARDENING_AGENT.into()],
+            name: Some("h1".into()),
+        })
+        .unwrap();
+    let (out, code) = output_until_exit(&mut c, &started.run_id);
+    assert_eq!(code, Some(0), "[{backend}] agent output:\n{out}");
+    for marker in [
+        "UNSHARE_EPERM",
+        "UNSHARE_CLI_BLOCKED",
+        "NETLINK_EPERM",
+        "PACKET_EPERM",
+        "VSOCK_EPERM",
+        "INET_OK",
+        "FORK_THREAD_OK",
+        "SECCOMP=2",
+        "STATUS_SECCOMP=denylist",
+        // Daemon przekazuje domyślne limity (pids.max=4096); czy cgroup v2 jest
+        // dostępne, zależy od hosta (applied albo unavailable przy best-effort).
+        "pids.max=4096",
+    ] {
+        assert!(
+            out.contains(marker),
+            "[{backend}] missing {marker} in:\n{out}"
+        );
+    }
+    assert!(
+        out.contains("STATUS_CGROUPS=applied") || out.contains("STATUS_CGROUPS=unavailable"),
+        "[{backend}] unexpected cgroups status in:\n{out}"
+    );
+    c.run_remove(&started.run_id, true).unwrap();
+}
+
+#[test]
+fn agent_syscalls_filtered() {
+    if !sandbox_supported() {
+        eprintln!("SKIP: namespaces or python3 not available");
+        return;
+    }
+    hardening_scenario("unshare");
+    if bwrap_available() {
+        hardening_scenario("bwrap");
+    }
+}

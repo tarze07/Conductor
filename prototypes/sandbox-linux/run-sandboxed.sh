@@ -16,6 +16,16 @@
 #   --pass-env NAME    (SANDBOX_PASS_ENV, lista ':') zmienne przekazywane do sandboksa
 #   --id NAME          (SANDBOX_ID)         identyfikator sandboksa w audycie
 #
+# Limity zasobow, cgroup v2 (issue #15; szczegoly w sandbox-cgroup.sh i README):
+#   --cgroups MODE     (SANDBOX_CGROUPS)    required | best-effort (domyslnie) | off
+#   --pids-max N       (SANDBOX_PIDS_MAX)   pids.max          (domyslnie: bez limitu)
+#   --memory-max SIZE  (SANDBOX_MEMORY_MAX) memory.max, np. 8G (domyslnie: bez limitu)
+#   --memory-swap-max SIZE (SANDBOX_MEMORY_SWAP_MAX) memory.swap.max (domyslnie 0)
+#   --cpu-max "Q P"    (SANDBOX_CPU_MAX)    cpu.max, np. "200000 100000" = 2 CPU
+#   --cgroup-parent DIR (SANDBOX_CGROUP_PARENT) delegowany cgroup nadrzedny
+#   best-effort: gdy cgroup v2 niedostepne, ostrzezenie na stderr i wpis "cgroups"
+#   w /run/conductor/sandbox-status.json; required: blad (kod 125) bez uruchamiania komendy.
+#
 # Co sie dzieje:
 #   1. na hoscie startuje egress-proxy.py na unix sockecie w prywatnym katalogu stanu,
 #   2. komenda startuje w nowych namespace'ach: net (tylko lo), mount, pid, ipc, uts
@@ -30,7 +40,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-$(command -v python3)}"
 
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 ALLOWLIST="${SANDBOX_ALLOWLIST:-$SCRIPT_DIR/allowlist.txt}"
 AUDIT_LOG="${SANDBOX_AUDIT_LOG:-}"
@@ -41,6 +51,11 @@ IFS=':' read -r -a _RO_ENV <<< "${SANDBOX_RO_PATHS:-}"
 MOUNTS=()   # "ro:PATH" / "rw:PATH", w kolejnosci
 for p in "${_RO_ENV[@]}"; do [[ -n "$p" ]] && MOUNTS+=("ro:$p"); done
 IFS=':' read -r -a PASS_ENV <<< "${SANDBOX_PASS_ENV:-}"
+# shellcheck source=sandbox-cgroup.sh
+source "$SCRIPT_DIR/sandbox-cgroup.sh"
+CG_MODE="${SANDBOX_CGROUPS:-best-effort}"; CG_PIDS_MAX="${SANDBOX_PIDS_MAX:-}"
+CG_MEMORY_MAX="${SANDBOX_MEMORY_MAX:-}"; CG_SWAP_MAX="${SANDBOX_MEMORY_SWAP_MAX:-0}"
+CG_CPU_MAX="${SANDBOX_CPU_MAX:-}"; CG_PARENT="${SANDBOX_CGROUP_PARENT:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +67,12 @@ while [[ $# -gt 0 ]]; do
     --etc)       ETC_MODE="$2"; shift 2 ;;
     --pass-env)  PASS_ENV+=("$2"); shift 2 ;;
     --id)        SANDBOX_ID="$2"; shift 2 ;;
+    --cgroups)   CG_MODE="$2"; shift 2 ;;
+    --pids-max)  CG_PIDS_MAX="$2"; shift 2 ;;
+    --memory-max) CG_MEMORY_MAX="$2"; shift 2 ;;
+    --memory-swap-max) CG_SWAP_MAX="$2"; shift 2 ;;
+    --cpu-max)   CG_CPU_MAX="$2"; shift 2 ;;
+    --cgroup-parent) CG_PARENT="$2"; shift 2 ;;
     -h|--help)   usage ;;
     --) usage ;;
     -*) echo "nieznana opcja: $1" >&2; usage ;;
@@ -70,6 +91,32 @@ if [[ "$BACKEND" == auto ]]; then
 fi
 case "$BACKEND" in bwrap|unshare) ;; *) echo "nieznany backend: $BACKEND" >&2; exit 2 ;; esac
 case "$ETC_MODE" in minimal|full) ;; *) echo "nieznany tryb /etc: $ETC_MODE" >&2; exit 2 ;; esac
+cg_validate || exit 2
+
+# --- user namespaces (bez roota): czytelny blad zamiast niejasnego "Permission denied" ---
+# Ubuntu 23.10+/24.04 blokuje nieuprzywilejowane user namespaces przez AppArmor
+# (kernel.apparmor_restrict_unprivileged_userns=1), Debian starszy niz 11 przez
+# kernel.unprivileged_userns_clone=0, inne systemy przez user.max_user_namespaces=0.
+userns_preflight() {
+  local probe out sysctl v info=""
+  if [[ "$BACKEND" == bwrap ]]; then probe=(bwrap --unshare-user --unshare-net --ro-bind / / true)
+  else probe=(unshare --user --map-root-user --net true); fi
+  out="$("${probe[@]}" 2>&1)" && return 0
+  for sysctl in kernel/apparmor_restrict_unprivileged_userns kernel/unprivileged_userns_clone user/max_user_namespaces; do
+    [[ -r "/proc/sys/$sysctl" ]] && v="$(cat "/proc/sys/$sysctl")" && info+=" ${sysctl//\//.}=$v"
+  done
+  echo "sandbox: nie mozna utworzyc user namespace (backend $BACKEND, uid $EUID): ${out:-blad}" >&2
+  echo "sandbox: ustawienia jadra:${info:- brak danych}" >&2
+  if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" == 1 ]]; then
+    echo "sandbox: AppArmor blokuje nieuprzywilejowane user namespaces. Zainstaluj profil" \
+         "z $SCRIPT_DIR/apparmor/ (opis w pliku profilu) albo uruchom jako root." >&2
+  else
+    echo "sandbox: user namespaces sa zablokowane (sysctl, polityka hardeningu albo seccomp" \
+         "rodzica); patrz README, sekcja Seccomp i cgroups." >&2
+  fi
+  return 1
+}
+if [[ $EUID -ne 0 ]]; then userns_preflight || exit 125; fi
 
 # Sciezki montowan rozwiazane z gory (blad, jesli nie istnieja).
 RESOLVED_MOUNTS=()
@@ -90,6 +137,7 @@ chmod 700 "$STATE"
 mkdir -m 700 "$STATE/egress" "$STATE/root"
 PROXY_PID=""
 cleanup() {
+  cgroup_cleanup
   if [[ -n "$PROXY_PID" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
     kill -TERM "$PROXY_PID" 2>/dev/null || true
     wait "$PROXY_PID" 2>/dev/null || true
@@ -99,6 +147,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# --- cgroup v2 (przed proxy: proxy nie trafia do cgroup agenta) ----------------------
+CG_NAME="conductor-sbx-$$-${STATE##*.}"
+cgroup_setup || exit 125
 
 # --- Egress Guard ------------------------------------------------------------------
 "$PYTHON" -I "$SCRIPT_DIR/egress-proxy.py" \
@@ -129,7 +181,7 @@ for name in "${PASS_ENV[@]}"; do
   [[ -n "$name" && -n "${!name+x}" ]] && ENV_ARGS+=("$name=${!name}")
 done
 
-INIT_ARGS=(--worktree "$WORKTREE" --etc "$ETC_MODE")
+INIT_ARGS=(--worktree "$WORKTREE" --etc "$ETC_MODE" --cgroup-status "$CG_STATUS")
 for m in "${RESOLVED_MOUNTS[@]}"; do INIT_ARGS+=(--mount "$m"); done
 
 rc=0
@@ -160,13 +212,13 @@ if [[ "$BACKEND" == bwrap ]]; then
   # i CAP_SETPCAP (zeby mogl wyczyscic bounding set). Init odbiera wszystkie
   # capabilities przed uruchomieniem mostu i komendy agenta.
   if [[ $EUID -eq 0 ]]; then BWRAP+=(--cap-drop ALL --cap-add CAP_NET_ADMIN --cap-add CAP_SETPCAP); fi
-  env -i "${ENV_ARGS[@]}" "${BWRAP[@]}" -- \
+  "${CG_EXEC[@]}" env -i "${ENV_ARGS[@]}" "${BWRAP[@]}" -- \
     "$PYTHON" -I /run/conductor/bin/sandbox-init.py --backend bwrap "${INIT_ARGS[@]}" -- "$@" || rc=$?
 else
   UNSHARE=(unshare --mount --net --pid --fork --ipc --uts --kill-child)
   # Bez roota: user namespace z mapowaniem na "root" wewnatrz (rootless).
   if [[ $EUID -ne 0 ]]; then UNSHARE+=(--user --map-root-user); fi
-  env -i "${ENV_ARGS[@]}" "${UNSHARE[@]}" -- \
+  "${CG_EXEC[@]}" env -i "${ENV_ARGS[@]}" "${UNSHARE[@]}" -- \
     "$PYTHON" -I "$SCRIPT_DIR/sandbox-init.py" --backend unshare "${INIT_ARGS[@]}" \
       --newroot "$STATE/root" --bin-src "$SCRIPT_DIR" --egress-src "$STATE/egress" \
       "${ETC_ENTRIES[@]/#/--etc-entry=}" \
