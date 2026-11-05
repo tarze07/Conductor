@@ -9,3 +9,6 @@ dist/
 
 # Tymczasowe worktree agentów
 .claude/worktrees/
+
+# SBOM generowane przez cargo-cyclonedx
+*.cdx.json
