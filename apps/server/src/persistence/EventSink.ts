@@ -418,13 +418,18 @@ export class EventSink {
             String(p.requestId)
           );
 
+        const turnRow = this.store.db
+          .prepare("SELECT status FROM projections_turns WHERE turn_id = ?")
+          .get(String(p.turnId)) as { status: string } | undefined;
+        const resumedStatus = turnRow?.status === "running" ? "running" : "idle";
+
         this.store.db
           .prepare(
             `UPDATE projections_threads
-             SET status = 'idle', last_event_seq = ?, updated_at = ?
+             SET status = ?, last_event_seq = ?, updated_at = ?
              WHERE thread_id = ?`
           )
-          .run(event.seq, event.createdAt, String(p.threadId));
+          .run(resumedStatus, event.seq, event.createdAt, String(p.threadId));
         break;
       }
 
@@ -694,6 +699,39 @@ export class EventSink {
       startedAt: row.started_at,
       finalizedAt: row.finalized_at ?? undefined
     };
+  }
+
+  public listTurnsForThread(threadId: string): readonly TurnRecord[] {
+    const rows = this.store.db
+      .prepare(
+        `SELECT turn_id, thread_id, prompt, status, checkpoint_ref, diff_summary_json,
+                error_message, started_at, finalized_at
+         FROM projections_turns WHERE thread_id = ?
+         ORDER BY started_at ASC, rowid ASC`
+      )
+      .all(threadId) as Array<{
+      turn_id: string;
+      thread_id: string;
+      prompt: string;
+      status: TurnRecord["status"];
+      checkpoint_ref: string | null;
+      diff_summary_json: string | null;
+      error_message: string | null;
+      started_at: string;
+      finalized_at: string | null;
+    }>;
+
+    return rows.map((row) => ({
+      turnId: row.turn_id,
+      threadId: row.thread_id,
+      prompt: row.prompt,
+      status: row.status,
+      checkpointRef: row.checkpoint_ref ?? undefined,
+      diffSummary: row.diff_summary_json ? JSON.parse(row.diff_summary_json) : undefined,
+      errorMessage: row.error_message ?? undefined,
+      startedAt: row.started_at,
+      finalizedAt: row.finalized_at ?? undefined
+    }));
   }
 
   public getRuntimeRequest(requestId: string): RuntimeRequestRecord | undefined {

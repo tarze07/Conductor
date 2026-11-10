@@ -41,12 +41,24 @@ importers:
 
   apps/server:
     dependencies:
+      '@conductor/agent-core':
+        specifier: workspace:*
+        version: link:../../packages/agent-core
       '@conductor/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
       '@conductor/network-guard':
         specifier: workspace:*
         version: link:../../packages/network-guard
+      '@conductor/provider-acp':
+        specifier: workspace:*
+        version: link:../../packages/provider-acp
+      '@conductor/provider-core':
+        specifier: workspace:*
+        version: link:../../packages/provider-core
+      '@conductor/provider-local-llm':
+        specifier: workspace:*
+        version: link:../../packages/provider-local-llm
       '@conductor/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -75,6 +87,9 @@ importers:
       '@conductor/network-guard':
         specifier: workspace:*
         version: link:../network-guard
+      '@conductor/provider-core':
+        specifier: workspace:*
+        version: link:../provider-core
       '@conductor/shared':
         specifier: workspace:*
         version: link:../shared
@@ -111,6 +126,9 @@ importers:
       '@conductor/provider-core':
         specifier: workspace:*
         version: link:../provider-core
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
 
   packages/provider-core:
     dependencies:
@@ -120,9 +138,15 @@ importers:
       '@conductor/shared':
         specifier: workspace:*
         version: link:../shared
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
 
   packages/provider-local-llm:
     dependencies:
+      '@conductor/agent-core':
+        specifier: workspace:*
+        version: link:../agent-core
       '@conductor/contracts':
         specifier: workspace:*
         version: link:../contracts
@@ -132,6 +156,9 @@ importers:
       '@conductor/provider-core':
         specifier: workspace:*
         version: link:../provider-core
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
 
   packages/secret-store-local:
     dependencies:
