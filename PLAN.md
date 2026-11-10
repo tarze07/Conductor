@@ -213,6 +213,34 @@ Conductor/
     └── enterprise-deployment/    # Instrukcja wdrożenia w sieci izolowanej (PKI, SSO, Nexus, vLLM)
 ```
 
+### 4.1. Stos Technologiczny (Technology Stack)
+
+1. **Język, Monorepo i Toolchain:**
+   - **Język:** **TypeScript (5.x / 7-preview)** w trybie ścisłym (`strict: true`, zero `any`).
+   - **Zarządzanie pakietami i monorepo:** **`pnpm` workspaces** (z obsługą lokalnego *offline store* oraz wewnętrznego rejestru Nexus / Artifactory / Verdaccio).
+   - **Testy:** **Vitest** (testy jednostkowe, integracyjne, deterministyczne testy *replay* dla orkiestratora oraz testy przeglądarkowe).
+   - **Linter i Formatter:** **Oxlint / Biome** (szybkie natywne narzędzia niewymagające połączenia z siecią).
+2. **Backend i Środowisko Wykonawcze (`apps/server`, `apps/cli`):**
+   - **Runtime:** **Node.js (22/24 LTS)**.
+   - **Architektura usług i kontraktów:**
+     - **Wariant A (1:1 jak w `t3code`):** biblioteka **Effect (`effect`, `@effect/schema`, `@effect/rpc`, `@effect/sql-sqlite-node`)** — silnie typowane usługi, kontrolowana współbieżność, `TestClock` oraz walidacja schematów.
+     - **Wariant B (lżejsza alternatywa):** czysty **TypeScript + `zod`** z zachowaniem wzorca `Orchestrator v2` + `EventSink` + `EffectWorker`.
+   - **Baza danych (Event Store + Projekcje + Outbox):** **SQLite** w trybie **WAL (Write-Ahead Logging)** (`node:sqlite` lub `better-sqlite3`) — jednoplikowa baza `statev2.sqlite` bez zewnętrznych serwerów bazodanowych.
+   - **Komunikacja:** **WebSocket (`ws`)** (typowany protokół RPC + strumieniowe subskrypcje zdarzeń) oraz wbudowany serwer HTTP/HTTPS z obsługą **mTLS / wewnętrznego PKI**.
+   - **Izolacja sieciowa (`@conductor/network-guard`):** interceptor oparty o **`undici.Dispatcher`** oraz `node:http`/`node:https` `Agent` blokujący ruch spoza RFC 1918 i białej listy hostów firmowych.
+   - **Terminale i Git:** **`node-pty`** (sesje pseudoterminala PTY) oraz natywne wywołania **Git plumbing** (`git write-tree`, `git commit-tree`, `git update-ref` na ukrytych referencjach `refs/conductor/checkpoints/*` z izolowanym `GIT_INDEX_FILE`).
+3. **Warstwa Agentów i Modeli AI (`packages/agent-core`, `packages/provider-*`):**
+   - **Komunikacja z lokalnymi LLM:** natywny klient HTTP/SSE zgodny ze standardem **OpenAI API (`/v1/chat/completions`)** oraz **Anthropic Messages API (`/v1/messages`)** (współpracujący z **vLLM, Ollama, LiteLLM Proxy, SGLang, TGI, llama.cpp**).
+   - **Protokoły narzędzi i rozszerzeń:** **MCP (`@modelcontextprotocol/sdk`)** (`stdio` oraz wewnętrzne `Streamable HTTP / SSE`) oraz **ACP (Agent Client Protocol)** (JSON-RPC po `stdio` dla lokalnych agentów CLI jak `OpenCode` czy `Pi`).
+4. **Frontend (`apps/web`):**
+   - **Framework i Bundler:** **React 19 + Vite**.
+   - **UI i Stylowanie:** **Tailwind CSS + komponenty w stylu shadcn/ui (Radix UI)** oraz ikony **Lucide** (wszystko wkompilowane lokalnie).
+   - **Terminal i Diff Viewer:** **`@xterm/xterm`** (renderowanie PTY na żywo), **`Shiki`** (gramatyki i motywy spakowane offline jako lokalne moduły JS/WASM) oraz wirtualizowane listy.
+   - **Zasoby statyczne:** lokalnie spakowane fonty (`Inter`, `JetBrains Mono` w formacie `.woff2`) + nagłówki **Strict CSP**.
+5. **Aplikacja Desktop i Wdrożenie (`apps/desktop`, `packaging/`):**
+   - **Desktop:** **Electron** (uruchamiający w tle lokalny proces serwera Node.js i ładujący UI przez schemat `conductor://`) lub opcjonalnie **Tauri**.
+   - **Konteneryzacja i dystrybucja Air-Gapped:** **Docker / Podman** (`docker-compose` z wewnętrzną siecią `internal: true`) oraz samowystarczalne paczki instalacyjne (`.deb`, `.rpm`, `.AppImage`, `.msi`, `.tar.gz`).
+
 ---
 
 ## 5. Szczegółowy Projekt Kluczowych Komponentów
