@@ -2,6 +2,21 @@ import { z } from "zod";
 import { OrchestrationEventSchema, ThreadProjectionSchema } from "./orchestration.js";
 import { RpcScopeSchema } from "./permissions.js";
 
+export const PublicEnvironmentDescriptorSchema = z.object({
+  environmentId: z.string().min(1),
+  protocolVersion: z.number().int().positive(),
+  capabilities: z.array(z.string()).default([]),
+  offlineMode: z.boolean()
+});
+export type PublicEnvironmentDescriptor = z.infer<typeof PublicEnvironmentDescriptorSchema>;
+
+export const EnvironmentRouteSchema = z.object({
+  kind: z.enum(["loopback", "lan", "tailnet"]).default("loopback"),
+  httpBaseUrl: z.string().url(),
+  wsBaseUrl: z.string().url()
+});
+export type EnvironmentRoute = z.infer<typeof EnvironmentRouteSchema>;
+
 export const RpcRequestEnvelopeSchema = z.object({
   frameType: z.literal("rpc.request"),
   requestId: z.string().min(1),

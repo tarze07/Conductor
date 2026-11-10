@@ -1,6 +1,9 @@
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import { URL } from "node:url";
 import { WebSocketServer, type WebSocket } from "ws";
+import { resolveSafeWorkspacePath } from "@conductor/agent-core";
 import {
   CLIENT_GUARDED_RPC_SCOPES,
   OrchestrationCommandSchema,
@@ -11,7 +14,11 @@ import {
   type RpcScope,
   type RpcStreamEventEnvelope
 } from "@conductor/contracts";
-import { DEFAULT_INTRANET_CIDRS, isIpInCidrs } from "@conductor/network-guard";
+import {
+  DEFAULT_INTRANET_CIDRS,
+  isIpInCidrs,
+  sanitizeSubprocessEnv
+} from "@conductor/network-guard";
 import {
   AuthorizationDeniedError,
   type AuthenticatedSession,
@@ -35,6 +42,9 @@ export interface ConductorRpcServerOptions {
   readonly projectionMaintenance: ProjectionMaintenance;
   readonly auth: EnvironmentAuthService;
   readonly checkpointStore: CheckpointStore;
+  readonly staticAssets?: Readonly<
+    Record<string, { readonly contentType: string; readonly body: string }>
+  >;
 }
 
 function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
@@ -236,6 +246,19 @@ export class ConductorRpcServer {
       return;
     }
 
+    if (req.method === "GET" && this.options.staticAssets) {
+      const asset = this.options.staticAssets[url.pathname];
+      if (asset) {
+        res.writeHead(200, {
+          "content-type": asset.contentType,
+          "content-security-policy":
+            "default-src 'self'; connect-src 'self' ws: wss:; font-src 'self' data:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
+        });
+        res.end(asset.body);
+        return;
+      }
+    }
+
     sendJson(res, 404, { error: "ERR_NOT_FOUND", message: "Route not found" });
   }
 
@@ -369,6 +392,48 @@ export class ConductorRpcServer {
         return this.options.checkpointStore.diffCheckpoints(p.repoPath, p.fromRef, p.toRef);
       }
 
+      case "filesystem.readFile": {
+        const p = params as { projectId: string; path: string };
+        const project = this.options.sink.getProject(p.projectId);
+        if (!project) {
+          throw new OrchestrationRejectedError(
+            "ERR_PROJECT_NOT_FOUND",
+            `Project '${p.projectId}' not found`
+          );
+        }
+        const safePath = resolveSafeWorkspacePath(project.rootPath, p.path);
+        const content = readFileSync(safePath, "utf8");
+        return { path: p.path, content };
+      }
+
+      case "terminal.open": {
+        const p = (params ?? {}) as { projectId?: string; cols?: number; rows?: number };
+        return {
+          terminalId: `pty_${Date.now()}`,
+          projectId: p.projectId,
+          cols: p.cols ?? 120,
+          rows: p.rows ?? 32
+        };
+      }
+
+      case "terminal.write": {
+        const p = params as { projectId: string; command: string };
+        const project = this.options.sink.getProject(p.projectId);
+        const cwd = project?.rootPath ?? process.cwd();
+        const sanitizedEnv = sanitizeSubprocessEnv(process.env);
+        const output = execFileSync("bash", ["-c", p.command], {
+          cwd,
+          env: sanitizedEnv,
+          encoding: "utf8"
+        }).trim();
+        return { ok: true, output };
+      }
+
+      case "terminal.resize": {
+        const p = params as { terminalId: string; cols: number; rows: number };
+        return { ok: true, terminalId: p.terminalId, cols: p.cols, rows: p.rows };
+      }
+
       case "access.createPairing": {
         const p = params as {
           label: string;
@@ -379,6 +444,12 @@ export class ConductorRpcServer {
           label: p.label,
           delegatedScopes: p.delegatedScopes
         });
+      }
+
+      case "access.revokeSession": {
+        const p = params as { sessionId: string };
+        this.options.auth.revokeSession(p.sessionId);
+        return { ok: true, sessionId: p.sessionId };
       }
 
       case "project.register":
