@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Runtime & local state
+.conductor/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+audit.jsonl
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Logs & coverage
+logs/
+*.log
+coverage/
+
+# OS & Editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
