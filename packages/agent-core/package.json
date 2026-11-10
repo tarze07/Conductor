@@ -12,10 +12,12 @@
   "dependencies": {
     "@conductor/contracts": "workspace:*",
     "@conductor/network-guard": "workspace:*",
+    "@conductor/provider-core": "workspace:*",
     "@conductor/shared": "workspace:*"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
   }
 }

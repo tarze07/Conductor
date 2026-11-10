@@ -10,8 +10,12 @@
     }
   },
   "dependencies": {
+    "@conductor/agent-core": "workspace:*",
     "@conductor/contracts": "workspace:*",
     "@conductor/network-guard": "workspace:*",
+    "@conductor/provider-acp": "workspace:*",
+    "@conductor/provider-core": "workspace:*",
+    "@conductor/provider-local-llm": "workspace:*",
     "@conductor/shared": "workspace:*",
     "ws": "^8.18.1"
   },

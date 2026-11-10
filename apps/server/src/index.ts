@@ -6,3 +6,4 @@ export * from "./orchestration-v2/EffectWorker.js";
 export * from "./checkpointing/CheckpointStore.js";
 export * from "./auth/EnvironmentAuth.js";
 export * from "./rpc/RpcServer.js";
+export * from "./provider/ProviderTurnRunner.js";
