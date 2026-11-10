@@ -12,10 +12,15 @@
   "dependencies": {
     "@conductor/contracts": "workspace:*",
     "@conductor/network-guard": "workspace:*",
-    "@conductor/shared": "workspace:*"
+    "@conductor/shared": "workspace:*",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.0"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
   }
 }
