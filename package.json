@@ -1,0 +1,24 @@
+{
+  "name": "conductor-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Enterprise offline/intranet agent harness control surface inspired by t3code",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify:offline": "vitest run packages/network-guard"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5",
+    "zod": "^3.24.2"
+  }
+}
