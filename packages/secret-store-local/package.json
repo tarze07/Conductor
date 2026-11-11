@@ -10,6 +10,7 @@
     }
   },
   "dependencies": {
+    "@conductor/network-guard": "workspace:*",
     "@conductor/shared": "workspace:*"
   },
   "scripts": {

@@ -12,6 +12,36 @@ export interface AuditRecord<TPayload = Record<string, unknown>> {
 
 const GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000";
 
+export function verifyAuditRecordsChain<TPayload = unknown>(
+  records: readonly AuditRecord<TPayload>[]
+): boolean {
+  for (let i = 0; i < records.length; i += 1) {
+    const rec = records[i]!;
+    if (!rec || typeof rec.hash !== "string" || typeof rec.prevHash !== "string") {
+      return false;
+    }
+    if (i > 0) {
+      const prev = records[i - 1]!;
+      if (rec.prevHash !== prev.hash) {
+        return false;
+      }
+    }
+    const expectedCanonical = JSON.stringify({
+      index: rec.index,
+      timestamp: rec.timestamp,
+      category: rec.category,
+      action: rec.action,
+      payload: rec.payload,
+      prevHash: rec.prevHash
+    });
+    const expectedHash = createHash("sha256").update(expectedCanonical).digest("hex");
+    if (rec.hash !== expectedHash) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export class TamperEvidentAuditChain<TPayload = Record<string, unknown>> {
   private readonly records: AuditRecord<TPayload>[] = [];
   private readonly maxRecords: number;
@@ -66,27 +96,6 @@ export class TamperEvidentAuditChain<TPayload = Record<string, unknown>> {
   }
 
   public verifyIntegrity(): boolean {
-    for (let i = 0; i < this.records.length; i += 1) {
-      const rec = this.records[i]!;
-      if (i > 0) {
-        const prev = this.records[i - 1]!;
-        if (rec.prevHash !== prev.hash) {
-          return false;
-        }
-      }
-      const expectedCanonical = JSON.stringify({
-        index: rec.index,
-        timestamp: rec.timestamp,
-        category: rec.category,
-        action: rec.action,
-        payload: rec.payload,
-        prevHash: rec.prevHash
-      });
-      const expectedHash = createHash("sha256").update(expectedCanonical).digest("hex");
-      if (rec.hash !== expectedHash) {
-        return false;
-      }
-    }
-    return true;
+    return verifyAuditRecordsChain(this.records);
   }
 }

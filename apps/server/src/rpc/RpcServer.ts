@@ -31,6 +31,11 @@ import {
 } from "../orchestration-v2/Orchestrator.js";
 import type { EventSink } from "../persistence/EventSink.js";
 import type { ProjectionMaintenance } from "../persistence/ProjectionMaintenance.js";
+import type {
+  PeerLinkDelegationRequest,
+  PeerLinkService
+} from "../peer-links/PeerLinkService.js";
+import type { RuntimeMode } from "@conductor/contracts";
 
 export interface ConductorRpcServerOptions {
   readonly environmentId: string;
@@ -42,6 +47,7 @@ export interface ConductorRpcServerOptions {
   readonly projectionMaintenance: ProjectionMaintenance;
   readonly auth: EnvironmentAuthService;
   readonly checkpointStore: CheckpointStore;
+  readonly peerLinkService?: PeerLinkService;
   readonly staticAssets?: Readonly<
     Record<string, { readonly contentType: string; readonly body: string }>
   >;
@@ -240,6 +246,33 @@ export class ConductorRpcServer {
         const code = error instanceof AuthorizationDeniedError ? error.code : "ERR_WS_TICKET";
         sendJson(res, 401, {
           error: code,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/mcp/peer-link" && this.options.peerLinkService) {
+      try {
+        const authHeader = req.headers.authorization ?? "";
+        const rawAccessToken = authHeader.replace(/^(Bearer|DPoP)\s+/i, "").trim();
+        const modeLimitRaw = req.headers["t3-mode-limit"];
+        const headerModeLimit =
+          modeLimitRaw === "plan-only" ||
+          modeLimitRaw === "supervised" ||
+          modeLimitRaw === "autonomous-sandbox"
+            ? (modeLimitRaw as RuntimeMode)
+            : undefined;
+        const body = (await readJsonBody(req)) as unknown as PeerLinkDelegationRequest;
+        const result = await this.options.peerLinkService.handleInboundDelegation({
+          rawAccessToken,
+          headerModeLimit,
+          request: body
+        });
+        sendJson(res, 200, result);
+      } catch (error) {
+        sendJson(res, 403, {
+          error: "ERR_PEER_LINK_REJECTED",
           message: error instanceof Error ? error.message : String(error)
         });
       }
