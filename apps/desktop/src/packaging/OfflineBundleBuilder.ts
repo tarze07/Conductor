@@ -175,7 +175,7 @@ Comment=Intranet AI Agent Control Surface (Zero Internet)
   fileContents.set("packages/appimage/AppRun", appRun);
   fileContents.set("packages/appimage/conductor.desktop", desktopEntry);
 
-  // 7. Windows Enterprise MSI (WiX) descriptor
+  // 7. Windows Enterprise MSI (WiX) descriptor & PowerShell Offline Installer (install-airgap.ps1)
   const wxsContent = `<?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="Conductor Studio Air-Gapped" Language="1045" Version="${version}.0" Manufacturer="Conductor Intranet" UpgradeCode="2ef68f66-26c3-40c6-a07d-4e4a831e3a74">
@@ -186,6 +186,41 @@ Comment=Intranet AI Agent Control Surface (Zero Internet)
 </Wix>
 `;
   fileContents.set("packages/msi/conductor.wxs", wxsContent);
+
+  const installPs1 = `#Requires -Version 5.1
+param(
+  [string]$Prefix = "$env:LOCALAPPDATA\\Programs\\Conductor"
+)
+$ErrorActionPreference = "Stop"
+
+Write-Host "[Conductor Air-Gap Windows] Weryfikacja sum kontrolnych SHA-256..."
+$BundleDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$SumsFile = Join-Path $BundleDir "SHA256SUMS"
+
+Get-Content $SumsFile | ForEach-Object {
+  if ($_ -match "^([0-9a-fA-F]{64})\\s+(.+)$") {
+    $expected = $Matches[1].ToLower()
+    $relPath = $Matches[2] -replace "/", "\\"
+    $targetFile = Join-Path $BundleDir $relPath
+    $actual = (Get-FileHash -Path $targetFile -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $expected) {
+      throw "Niezgodność SHA-256 dla pliku: $relPath"
+    }
+  }
+}
+
+Write-Host "[Conductor Air-Gap Windows] Instalacja w $Prefix (tryb 100% offline)..."
+New-Item -ItemType Directory -Force -Path (Join-Path $Prefix "web-ui") | Out-Null
+Copy-Item -Recurse -Force (Join-Path $BundleDir "web-ui\\*") (Join-Path $Prefix "web-ui")
+Copy-Item -Force (Join-Path $BundleDir "offline-bundle-manifest.json") $Prefix
+
+[Environment]::SetEnvironmentVariable("CONDUCTOR_OFFLINE_MODE", "1", "User")
+[Environment]::SetEnvironmentVariable("HF_HUB_OFFLINE", "1", "User")
+[Environment]::SetEnvironmentVariable("CONDUCTOR_ALLOW_PUBLIC_EGRESS", "0", "User")
+
+Write-Host "[Conductor Air-Gap Windows] Instalacja zakończona pomyślnie."
+`;
+  fileContents.set("install-airgap.ps1", installPs1);
 
   // Write all files and compute SHA-256 entries
   const entries: OfflineBundleFileEntry[] = [];
