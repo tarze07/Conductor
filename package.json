@@ -13,6 +13,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e:airgap": "node scripts/run-e2e-airgap.mjs",
+    "package:offline": "node packaging/offline-bundle/build-offline-bundle.mjs",
     "verify:offline": "vitest run packages/network-guard"
   },
   "devDependencies": {

@@ -50,9 +50,45 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@conductor/cli':
+        specifier: workspace:*
+        version: link:../cli
+      '@conductor/client-runtime':
+        specifier: workspace:*
+        version: link:../../packages/client-runtime
+      '@conductor/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@conductor/network-guard':
+        specifier: workspace:*
+        version: link:../../packages/network-guard
+      '@conductor/provider-acp':
+        specifier: workspace:*
+        version: link:../../packages/provider-acp
+      '@conductor/provider-core':
+        specifier: workspace:*
+        version: link:../../packages/provider-core
+      '@conductor/provider-local-llm':
+        specifier: workspace:*
+        version: link:../../packages/provider-local-llm
+      '@conductor/secret-store-local':
+        specifier: workspace:*
+        version: link:../../packages/secret-store-local
       '@conductor/server':
         specifier: workspace:*
         version: link:../server
+      '@conductor/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
+      '@conductor/source-control-core':
+        specifier: workspace:*
+        version: link:../../packages/source-control-core
+      '@conductor/source-control-forgejo':
+        specifier: workspace:*
+        version: link:../../packages/source-control-forgejo
+      '@conductor/source-control-gitlab':
+        specifier: workspace:*
+        version: link:../../packages/source-control-gitlab
       '@conductor/web':
         specifier: workspace:*
         version: link:../web

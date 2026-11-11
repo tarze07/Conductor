@@ -50,10 +50,21 @@ export class MultiEnvironmentRegistry {
     return results;
   }
 
+  public async removeEnvironment(environmentId: string): Promise<void> {
+    const client = this.clients.get(environmentId);
+    if (client) {
+      await client.close();
+      this.clients.delete(environmentId);
+    }
+    this.registrations.delete(environmentId);
+  }
+
   public async closeAll(): Promise<void> {
     for (const client of this.clients.values()) {
       await client.close();
     }
     this.clients.clear();
+    this.registrations.clear();
   }
 }
+

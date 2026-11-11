@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# Conductor Air-Gapped Server & Web UI Image (packaging/docker/Dockerfile.airgap)
+# Designed to build from a pre-populated vendor/offline store and run inside `internal: true` networks.
+
+FROM node:22-bookworm-slim AS runtime
+
+RUN groupadd -r conductor && useradd -r -g conductor -m -d /home/conductor conductor
+
+WORKDIR /opt/conductor
+
+# Strict offline & air-gapped environment variables
+ENV NODE_ENV=production \
+    CONDUCTOR_OFFLINE_MODE=1 \
+    CONDUCTOR_ALLOW_PUBLIC_EGRESS=0 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    DO_NOT_TRACK=1 \
+    TELEMETRY_DISABLED=1
+
+COPY --chown=conductor:conductor package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY --chown=conductor:conductor packages ./packages
+COPY --chown=conductor:conductor apps ./apps
+
+USER conductor
+EXPOSE 4317
+
+CMD ["node", "apps/cli/dist/index.js"]
