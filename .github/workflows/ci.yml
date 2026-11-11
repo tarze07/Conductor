@@ -50,3 +50,7 @@ jobs:
 
       - name: Verify Air-Gapped Offline Bundle Generation
         run: pnpm package:offline
+
+      - name: Verify Release Artifact Generation
+        run: pnpm package:release
+

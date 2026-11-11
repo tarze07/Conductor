@@ -39,7 +39,7 @@ export class CheckpointRestoreRejectedError extends Error {
 }
 
 function runGit(repoPath: string, args: readonly string[], extraEnv?: NodeJS.ProcessEnv): string {
-  return execFileSync("git", args, {
+  return execFileSync("git", ["-c", "core.autocrlf=false", ...args], {
     cwd: repoPath,
     env: {
       ...process.env,

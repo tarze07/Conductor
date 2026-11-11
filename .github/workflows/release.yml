@@ -137,12 +137,8 @@ jobs:
         run: pnpm build
 
       - name: Generate Windows Air-Gapped Release Artifacts (x64)
-        run: |
-          node packaging/offline-bundle/build-release-artifacts.mjs `
-            --platform win32 `
-            --arch x64 `
-            --version "${{ needs.verify.outputs.version }}" `
-            --out-dir dist/release-windows
+        shell: pwsh
+        run: node packaging/offline-bundle/build-release-artifacts.mjs --platform win32 --arch x64 --version "${{ needs.verify.outputs.version }}" --out-dir dist/release-windows
 
       - name: Upload Windows Release Artifacts
         uses: actions/upload-artifact@v4
