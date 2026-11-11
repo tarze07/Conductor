@@ -10,7 +10,19 @@
     }
   },
   "dependencies": {
+    "@conductor/cli": "workspace:*",
+    "@conductor/client-runtime": "workspace:*",
+    "@conductor/contracts": "workspace:*",
+    "@conductor/network-guard": "workspace:*",
+    "@conductor/provider-acp": "workspace:*",
+    "@conductor/provider-core": "workspace:*",
+    "@conductor/provider-local-llm": "workspace:*",
+    "@conductor/secret-store-local": "workspace:*",
     "@conductor/server": "workspace:*",
+    "@conductor/shared": "workspace:*",
+    "@conductor/source-control-core": "workspace:*",
+    "@conductor/source-control-forgejo": "workspace:*",
+    "@conductor/source-control-gitlab": "workspace:*",
     "@conductor/web": "workspace:*"
   },
   "scripts": {

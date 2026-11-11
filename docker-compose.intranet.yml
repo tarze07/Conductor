@@ -1,0 +1,66 @@
+# Reference Air-Gapped / Intranet Deployment & E2E Stack (`docker-compose.intranet.yml`)
+# Uses `internal: true` on the Docker bridge network so containers have ZERO default gateway to the internet.
+
+name: conductor-intranet-stack
+
+services:
+  conductor-server:
+    build:
+      context: .
+      dockerfile: packaging/docker/Dockerfile.airgap
+    container_name: conductor-server
+    restart: unless-stopped
+    environment:
+      CONDUCTOR_OFFLINE_MODE: "1"
+      CONDUCTOR_ALLOW_PUBLIC_EGRESS: "0"
+      HF_HUB_OFFLINE: "1"
+      CONDUCTOR_LOCAL_LLM_BASE_URL: "http://172.28.0.20:8000/v1"
+      CONDUCTOR_FORGEJO_BASE_URL: "http://172.28.0.30:3000"
+      CONDUCTOR_INTERNAL_REGISTRY_URL: "http://172.28.0.40:8081/repository/conductor-releases"
+    networks:
+      conductor_intranet:
+        ipv4_address: 172.28.0.10
+
+  intranet-llm:
+    build:
+      context: .
+      dockerfile: packaging/docker/Dockerfile.mock-intranet
+    container_name: intranet-llm-vllm-ollama
+    restart: unless-stopped
+    environment:
+      CONDUCTOR_OFFLINE_MODE: "1"
+    networks:
+      conductor_intranet:
+        ipv4_address: 172.28.0.20
+
+  intranet-forgejo:
+    build:
+      context: .
+      dockerfile: packaging/docker/Dockerfile.mock-intranet
+    container_name: intranet-forgejo-scm
+    restart: unless-stopped
+    environment:
+      CONDUCTOR_OFFLINE_MODE: "1"
+    networks:
+      conductor_intranet:
+        ipv4_address: 172.28.0.30
+
+  conductor-e2e-runner:
+    build:
+      context: .
+      dockerfile: packaging/docker/Dockerfile.airgap
+    container_name: conductor-e2e-network-none
+    network_mode: "none"
+    environment:
+      CONDUCTOR_OFFLINE_MODE: "1"
+      CONDUCTOR_ALLOW_PUBLIC_EGRESS: "0"
+      HF_HUB_OFFLINE: "1"
+    command: ["pnpm", "test"]
+
+networks:
+  conductor_intranet:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

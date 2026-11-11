@@ -296,48 +296,48 @@ Ponieważ w sieci firmowej nie można polegać na zewnętrznych usługach typu C
 ## 6. Plan Realizacji (Harmonogram Fazowy)
 
 ### Faza 1: Fundamenty Monorepo, Kontrakty i `NetworkGuard`
-- [ ] Inicjalizacja monorepo (`pnpm-workspace.yaml`, `tsconfig.base.json`, konfiguracja budowania i testów `vitest`).
-- [ ] Implementacja `@conductor/network-guard`:
+- [x] Inicjalizacja monorepo (`pnpm-workspace.yaml`, `tsconfig.base.json`, konfiguracja budowania i testów `vitest`).
+- [x] Implementacja `@conductor/network-guard`:
   - Blokada połączeń wychodzących poza podsieci prywatne RFC 1918 i skonfigurowaną białą listę (`allowlist`).
   - Obsługa własnych certyfikatów CA (`caBundlePath`) i sanityzacja zmiennych środowiskowych subprocesów.
   - Testy jednostkowe potwierdzające blokadę ruchu do publicznych adresów IP i domen.
-- [ ] Implementacja `@conductor/contracts`:
+- [x] Implementacja `@conductor/contracts`:
   - Definicje schematów komend, zdarzeń, projekcji, modeli uprawnień oraz komunikatów WebSocket RPC.
 
 ### Faza 2: Serwer, `Orchestrator v2`, SQLite `EventSink` i `CheckpointStore`
-- [ ] Implementacja warstwy bazodanowej SQLite (`statev2.sqlite`) z tabelami `events`, `projections_*`, `command_receipts` i `outbox`.
-- [ ] Implementacja czystego `Orchestrator` oraz `EffectWorker` z gwarancją idempotentności i wznawiania po restarcie.
-- [ ] Implementacja `CheckpointStore` opartego o tymczasowy `GIT_INDEX_FILE` i ukryte referencje `refs/conductor/checkpoints/*` (tworzenie snapshotu, generowanie diffów, przywracanie stanu).
-- [ ] Implementacja serwera WebSocket RPC z autoryzacją tokenową i subskrypcjami strumieniowymi.
+- [x] Implementacja warstwy bazodanowej SQLite (`statev2.sqlite`) z tabelami `events`, `projections_*`, `command_receipts` i `outbox`.
+- [x] Implementacja czystego `Orchestrator` oraz `EffectWorker` z gwarancją idempotentności i wznawiania po restarcie.
+- [x] Implementacja `CheckpointStore` opartego o tymczasowy `GIT_INDEX_FILE` i ukryte referencje `refs/conductor/checkpoints/*` (tworzenie snapshotu, generowanie diffów, przywracanie stanu).
+- [x] Implementacja serwera WebSocket RPC z autoryzacją tokenową i subskrypcjami strumieniowymi.
 
 ### Faza 3: Wbudowany Silnik Agenta (`agent-core`) i Adapter Lokalnych LLM
-- [ ] Implementacja `@conductor/provider-local-llm` obsługującego lokalne endpointy vLLM, Ollama, LiteLLM i llama.cpp (ze strumieniowaniem SSE i obsługą `tool_calls`).
-- [ ] Implementacja `@conductor/agent-core`:
+- [x] Implementacja `@conductor/provider-local-llm` obsługującego lokalne endpointy vLLM, Ollama, LiteLLM i llama.cpp (ze strumieniowaniem SSE i obsługą `tool_calls`).
+- [x] Implementacja `@conductor/agent-core`:
   - Pętla wykonawcza ReAct z obsługą budżetu tokenów i anulowania (`AbortSignal`).
   - Wbudowane narzędzia plikowe, wyszukiwarka kodu oraz menedżer sesji PTY z bramką uprawnień (`PermissionGate`).
   - Klient lokalnych serwerów MCP (`stdio` oraz wewnętrzne `HTTP/SSE`).
-- [ ] Implementacja `@conductor/provider-acp` dla zewnętrznych, lokalnych narzędzi CLI zgodnych z Agent Client Protocol.
+- [x] Implementacja `@conductor/provider-acp` dla zewnętrznych, lokalnych narzędzi CLI zgodnych z Agent Client Protocol.
 
 ### Faza 4: Interfejs Web UI (100% Offline Bundle) i CLI
-- [ ] Stworzenie `@conductor/client-runtime` (zarządzanie połączeniem WebSocket, auto-reconnect, synchronizacja kursorów zdarzeń).
-- [ ] Implementacja `apps/web` (React + Vite):
+- [x] Stworzenie `@conductor/client-runtime` (zarządzanie połączeniem WebSocket, auto-reconnect, synchronizacja kursorów zdarzeń).
+- [x] Implementacja `apps/web` (React + Vite):
   - Widok wątków projektu, strumieniowy czat z podglądem kroków narzędziowych na żywo.
   - Wbudowany przeglądarkowy podgląd diffów (checkpoint vs bieżące drzewo robocze) oraz przycisk cofania tury.
   - Panel zatwierdzania uprawnień (akceptacja/odrzucanie komend terminalowych) oraz zintegrowany terminal.
   - Lokalny bundling wszystkich czcionek, ikon i gramatyk kolorowania składni + nagłówki CSP blokujące zewnętrzne zasoby.
-- [ ] Implementacja `apps/cli` (`conductor start`, `conductor pair`, `conductor doctor --verify-offline`).
+- [x] Implementacja `apps/cli` (`conductor start`, `conductor pair`, `conductor doctor --verify-offline`).
 
 ### Faza 5: Integracje Korporacyjne On-Premise i Bezpieczeństwo
-- [ ] Implementacja adapterów Source Control dla **GitLab Self-Managed** oraz **Gitea / Forgejo** (rozpoznawanie gałęzi, tworzenie i linkowanie Merge/Pull Requestów, odczyt statusów CI).
-- [ ] Integracja uwierzytelniania korporacyjnego (OIDC / Keycloak) dla trybu współdzielonego serwera deweloperskiego w intranecie.
-- [ ] Implementacja `@conductor/secret-store-local` (zaszyfrowany magazyn lokalny + opcjonalny odczyt sekretów z firmowego HashiCorp Vault).
-- [ ] Implementacja dziennika audytu (`AuditLogger`) z łańcuchem skrótów SHA-256.
+- [x] Implementacja adapterów Source Control dla **GitLab Self-Managed** oraz **Gitea / Forgejo** (rozpoznawanie gałęzi, tworzenie i linkowanie Merge/Pull Requestów, odczyt statusów CI).
+- [x] Integracja uwierzytelniania korporacyjnego (OIDC / Keycloak) dla trybu współdzielonego serwera deweloperskiego w intranecie.
+- [x] Implementacja `@conductor/secret-store-local` (zaszyfrowany magazyn lokalny + opcjonalny odczyt sekretów z firmowego HashiCorp Vault).
+- [x] Implementacja dziennika audytu (`AuditLogger`) z łańcuchem skrótów SHA-256.
 
 ### Faza 6: Pakietowanie Air-Gapped, Desktop i Weryfikacja E2E
-- [ ] Przygotowanie `apps/desktop` (powłoka Electron/Tauri uruchamiająca lokalny serwer Conductor).
-- [ ] Stworzenie skryptów pakujących `packaging/offline-bundle` (generowanie samowystarczalnych archiwów instalacyjnych oraz obrazów Docker niewymagających dostępu do sieci podczas instalacji).
-- [ ] Przygotowanie `docker-compose.intranet.yml` zestawiającego Conductor + lokalny serwer modeli (Ollama/vLLM) + lokalny Forgejo/GitLab do testów w całkowicie odizolowanej sieci (`internal: true`).
-- [ ] Pełny zestaw testów E2E uruchamianych z flagą `--network=none`.
+- [x] Przygotowanie `apps/desktop` (powłoka Electron/Tauri uruchamiająca lokalny serwer Conductor).
+- [x] Stworzenie skryptów pakujących `packaging/offline-bundle` (generowanie samowystarczalnych archiwów instalacyjnych oraz obrazów Docker niewymagających dostępu do sieci podczas instalacji).
+- [x] Przygotowanie `docker-compose.intranet.yml` zestawiającego Conductor + lokalny serwer modeli (Ollama/vLLM) + lokalny Forgejo/GitLab do testów w całkowicie odizolowanej sieci (`internal: true`).
+- [x] Pełny zestaw testów E2E uruchamianych z flagą `--network=none`.
 
 ---
 
