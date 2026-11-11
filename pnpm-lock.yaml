@@ -77,9 +77,21 @@ importers:
       '@conductor/provider-local-llm':
         specifier: workspace:*
         version: link:../../packages/provider-local-llm
+      '@conductor/secret-store-local':
+        specifier: workspace:*
+        version: link:../../packages/secret-store-local
       '@conductor/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@conductor/source-control-core':
+        specifier: workspace:*
+        version: link:../../packages/source-control-core
+      '@conductor/source-control-forgejo':
+        specifier: workspace:*
+        version: link:../../packages/source-control-forgejo
+      '@conductor/source-control-gitlab':
+        specifier: workspace:*
+        version: link:../../packages/source-control-gitlab
       ws:
         specifier: ^8.18.1
         version: 8.22.2
@@ -187,6 +199,9 @@ importers:
 
   packages/secret-store-local:
     dependencies:
+      '@conductor/network-guard':
+        specifier: workspace:*
+        version: link:../network-guard
       '@conductor/shared':
         specifier: workspace:*
         version: link:../shared
@@ -198,9 +213,15 @@ importers:
       '@conductor/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@conductor/network-guard':
+        specifier: workspace:*
+        version: link:../network-guard
 
   packages/source-control-forgejo:
     dependencies:
+      '@conductor/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@conductor/network-guard':
         specifier: workspace:*
         version: link:../network-guard
@@ -210,6 +231,9 @@ importers:
 
   packages/source-control-gitlab:
     dependencies:
+      '@conductor/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@conductor/network-guard':
         specifier: workspace:*
         version: link:../network-guard

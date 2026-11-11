@@ -10,7 +10,8 @@
     }
   },
   "dependencies": {
-    "@conductor/contracts": "workspace:*"
+    "@conductor/contracts": "workspace:*",
+    "@conductor/network-guard": "workspace:*"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

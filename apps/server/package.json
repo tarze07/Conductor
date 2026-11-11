@@ -16,7 +16,11 @@
     "@conductor/provider-acp": "workspace:*",
     "@conductor/provider-core": "workspace:*",
     "@conductor/provider-local-llm": "workspace:*",
+    "@conductor/secret-store-local": "workspace:*",
     "@conductor/shared": "workspace:*",
+    "@conductor/source-control-core": "workspace:*",
+    "@conductor/source-control-forgejo": "workspace:*",
+    "@conductor/source-control-gitlab": "workspace:*",
     "ws": "^8.18.1"
   },
   "devDependencies": {

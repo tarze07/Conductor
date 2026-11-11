@@ -800,4 +800,17 @@ export class EventSink {
       createdAt: row.created_at
     }));
   }
+
+  public updateThreadPullRequests(
+    threadId: string,
+    pullRequests: readonly LinkedPullRequest[]
+  ): void {
+    this.store.db
+      .prepare(
+        `UPDATE projections_threads
+         SET pull_requests_json = ?
+         WHERE thread_id = ?`
+      )
+      .run(JSON.stringify(pullRequests), threadId);
+  }
 }
