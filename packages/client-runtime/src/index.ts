@@ -1,1 +1,2 @@
-export const PACKAGE_NAME = "@conductor/client-runtime" as const;
+export * from "./EnvironmentClient.js";
+export * from "./MultiEnvironmentRegistry.js";

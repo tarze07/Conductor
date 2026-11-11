@@ -469,6 +469,12 @@ export class EnvironmentAuthService {
     }
   }
 
+  public revokeSession(sessionId: string): void {
+    this.store.db
+      .prepare("UPDATE auth_sessions SET revoked = 1 WHERE session_id = ?")
+      .run(sessionId);
+  }
+
   private insertPairingGrant(params: {
     readonly label: string;
     readonly scopes: readonly RpcScope[];

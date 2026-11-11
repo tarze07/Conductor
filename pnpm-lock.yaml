@@ -23,12 +23,30 @@ importers:
 
   apps/cli:
     dependencies:
+      '@conductor/client-runtime':
+        specifier: workspace:*
+        version: link:../../packages/client-runtime
       '@conductor/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
       '@conductor/network-guard':
         specifier: workspace:*
         version: link:../../packages/network-guard
+      '@conductor/provider-acp':
+        specifier: workspace:*
+        version: link:../../packages/provider-acp
+      '@conductor/provider-core':
+        specifier: workspace:*
+        version: link:../../packages/provider-core
+      '@conductor/provider-local-llm':
+        specifier: workspace:*
+        version: link:../../packages/provider-local-llm
+      '@conductor/server':
+        specifier: workspace:*
+        version: link:../server
+      '@conductor/web':
+        specifier: workspace:*
+        version: link:../web
 
   apps/desktop:
     dependencies:
@@ -102,6 +120,13 @@ importers:
       '@conductor/shared':
         specifier: workspace:*
         version: link:../shared
+      ws:
+        specifier: ^8.18.1
+        version: 8.22.2
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.0
+        version: 8.18.2
 
   packages/contracts:
     dependencies:
