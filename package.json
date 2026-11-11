@@ -15,6 +15,7 @@
     "test:watch": "vitest",
     "test:e2e:airgap": "node scripts/run-e2e-airgap.mjs",
     "package:offline": "node packaging/offline-bundle/build-offline-bundle.mjs",
+    "package:release": "node packaging/offline-bundle/build-release-artifacts.mjs",
     "verify:offline": "vitest run packages/network-guard"
   },
   "devDependencies": {

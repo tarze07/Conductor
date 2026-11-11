@@ -226,6 +226,7 @@ describe("Phase 6 — Air-Gapped Offline Bundle Builder & docker-compose.intrane
       expect(verification.valid).toBe(true);
       expect(verification.checkedFilesCount).toBeGreaterThanOrEqual(10);
       expect(existsSync(join(tempBundleDir, "install-airgap.sh"))).toBe(true);
+      expect(existsSync(join(tempBundleDir, "install-airgap.ps1"))).toBe(true);
       expect(existsSync(join(tempBundleDir, "packages/deb/DEBIAN/control"))).toBe(true);
       expect(existsSync(join(tempBundleDir, "packages/rpm/conductor.spec"))).toBe(true);
       expect(existsSync(join(tempBundleDir, "packages/appimage/AppRun"))).toBe(true);
@@ -237,6 +238,16 @@ describe("Phase 6 — Air-Gapped Offline Bundle Builder & docker-compose.intrane
       expect(composeText).toContain("internal: true");
       expect(composeText).toContain('network_mode: "none"');
       expect(composeText).toContain('CONDUCTOR_OFFLINE_MODE: "1"');
+
+      // Verify INSTALL.md and GitHub Actions Release workflow for Linux & Windows
+      const installMdPath = resolve(process.cwd(), "INSTALL.md");
+      expect(existsSync(installMdPath)).toBe(true);
+      const releaseWfPath = resolve(process.cwd(), ".github/workflows/release.yml");
+      expect(existsSync(releaseWfPath)).toBe(true);
+      const releaseWfText = readFileSync(releaseWfPath, "utf8");
+      expect(releaseWfText).toContain("build-linux:");
+      expect(releaseWfText).toContain("build-windows:");
+      expect(releaseWfText).toContain("publish-release:");
     } finally {
       rmSync(tempBundleDir, { recursive: true, force: true });
     }
