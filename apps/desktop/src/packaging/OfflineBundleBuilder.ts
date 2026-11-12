@@ -94,8 +94,12 @@ mkdir -p "\${PREFIX}/web-ui" "\${PREFIX}/systemd"
 cp -r "\${BUNDLE_DIR}/web-ui/"* "\${PREFIX}/web-ui/"
 cp "\${BUNDLE_DIR}/offline-bundle-manifest.json" "\${PREFIX}/"
 cp "\${BUNDLE_DIR}/systemd/conductor-server.service" "\${PREFIX}/systemd/"
+if [ -d "\${BUNDLE_DIR}/runtime" ]; then
+  mkdir -p "\${PREFIX}/runtime"
+  cp -r "\${BUNDLE_DIR}/runtime/"* "\${PREFIX}/runtime/"
+fi
 
-echo "[Conductor Air-Gap] Instalacja zakończona pomyślnie."
+echo "[Conductor Air-Gap] Instalacja zakonczona pomyslnie w \${PREFIX}."
 `;
   fileContents.set("install-airgap.sh", installScript);
 
@@ -176,6 +180,8 @@ Comment=Intranet AI Agent Control Surface (Zero Internet)
   fileContents.set("packages/appimage/conductor.desktop", desktopEntry);
 
   // 7. Windows Enterprise MSI (WiX) descriptor & PowerShell Offline Installer (install-airgap.ps1)
+  // NOTE: install-airgap.ps1 is strictly 7-bit ASCII so Windows PowerShell 5.1 (which defaults to
+  // Windows-1250/1252 when no BOM is present) never misinterprets UTF-8 byte 0x84 ('ń') as a quote ('„').
   const wxsContent = `<?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="Conductor Studio Air-Gapped" Language="1045" Version="${version}.0" Manufacturer="Conductor Intranet" UpgradeCode="2ef68f66-26c3-40c6-a07d-4e4a831e3a74">
@@ -204,7 +210,7 @@ Get-Content $SumsFile | ForEach-Object {
     $targetFile = Join-Path $BundleDir $relPath
     $actual = (Get-FileHash -Path $targetFile -Algorithm SHA256).Hash.ToLower()
     if ($actual -ne $expected) {
-      throw "Niezgodność SHA-256 dla pliku: $relPath"
+      throw "Niezgodnosc SHA-256 dla pliku: $relPath"
     }
   }
 }
@@ -214,11 +220,17 @@ New-Item -ItemType Directory -Force -Path (Join-Path $Prefix "web-ui") | Out-Nul
 Copy-Item -Recurse -Force (Join-Path $BundleDir "web-ui\\*") (Join-Path $Prefix "web-ui")
 Copy-Item -Force (Join-Path $BundleDir "offline-bundle-manifest.json") $Prefix
 
+$RuntimeSource = Join-Path $BundleDir "runtime"
+if (Test-Path $RuntimeSource) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $Prefix "runtime") | Out-Null
+  Copy-Item -Recurse -Force (Join-Path $RuntimeSource "*") (Join-Path $Prefix "runtime")
+}
+
 [Environment]::SetEnvironmentVariable("CONDUCTOR_OFFLINE_MODE", "1", "User")
 [Environment]::SetEnvironmentVariable("HF_HUB_OFFLINE", "1", "User")
 [Environment]::SetEnvironmentVariable("CONDUCTOR_ALLOW_PUBLIC_EGRESS", "0", "User")
 
-Write-Host "[Conductor Air-Gap Windows] Instalacja zakończona pomyślnie."
+Write-Host "[Conductor Air-Gap Windows] Instalacja zakonczona pomyslnie w $Prefix."
 `;
   fileContents.set("install-airgap.ps1", installPs1);
 
