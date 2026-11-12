@@ -51,6 +51,14 @@ jobs:
       - name: Verify Air-Gapped Offline Bundle Generation
         run: pnpm package:offline
 
+      - name: Test Linux Offline Installer (install-airgap.sh)
+        if: runner.os == 'Linux'
+        run: CONDUCTOR_INSTALL_PREFIX="$RUNNER_TEMP/conductor-install-test" bash dist/offline-bundle/install-airgap.sh
+
+      - name: Test Windows Offline Installer (install-airgap.ps1 via Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\dist\offline-bundle\install-airgap.ps1 -Prefix "$env:RUNNER_TEMP\conductor-install-test"
+
       - name: Verify Release Artifact Generation
         run: pnpm package:release
-

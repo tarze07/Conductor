@@ -227,6 +227,8 @@ describe("Phase 6 — Air-Gapped Offline Bundle Builder & docker-compose.intrane
       expect(verification.checkedFilesCount).toBeGreaterThanOrEqual(10);
       expect(existsSync(join(tempBundleDir, "install-airgap.sh"))).toBe(true);
       expect(existsSync(join(tempBundleDir, "install-airgap.ps1"))).toBe(true);
+      const ps1Text = readFileSync(join(tempBundleDir, "install-airgap.ps1"), "utf8");
+      expect(/^[\x00-\x7F]*$/.test(ps1Text)).toBe(true);
       expect(existsSync(join(tempBundleDir, "packages/deb/DEBIAN/control"))).toBe(true);
       expect(existsSync(join(tempBundleDir, "packages/rpm/conductor.spec"))).toBe(true);
       expect(existsSync(join(tempBundleDir, "packages/appimage/AppRun"))).toBe(true);
