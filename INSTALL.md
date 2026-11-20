@@ -143,6 +143,35 @@ Conductor jest sterowany zmiennymi środowiskowymi oraz konfiguracją instancji 
 | `CONDUCTOR_LOCAL_LLM_BASE_URL` | `http://127.0.0.1:11434/v1` | Adres lokalnego serwera **Ollama**, **vLLM** lub **LiteLLM Proxy** |
 | `CONDUCTOR_INTERNAL_REGISTRY_URL` | *(brak / wyłączony)* | Adres wewnętrznego serwera Nexus/Artifactory dla `DesktopAutoUpdater` |
 
+### 6.1. Podłączanie lokalnego agenta CLI zgodnego z ACP v1 (np. `opencode acp`)
+
+Adapter `@conductor/provider-acp` implementuje pełny protokół **Agent Client Protocol (ACP v1)** (JSON-RPC 2.0 po `stdio`, długowieczna sesja na wątek z `session/load`, strumieniowanie `session/update`, uprawnienia `session/request_permission`, operacje `fs/read_text_file` / `fs/write_text_file` ograniczone do `workspaceRoot` oraz przekazywanie serwera MCP wątku w `mcpServers`).
+
+Przykładowa konfiguracja instancji providera ACP uruchamiającej lokalny `opencode acp` podłączony do wewnętrznego klastra **vLLM** lub **Ollama** w sieci firmowej (bez dostępu do internetu):
+
+```json
+{
+  "instanceId": "acp-opencode-local",
+  "driverKind": "acp",
+  "label": "OpenCode ACP (Intranet vLLM)",
+  "enabled": true,
+  "defaultModel": "Qwen/Qwen2.5-Coder-32B-Instruct",
+  "caBundlePath": "/etc/ssl/certs/corp-root-ca.pem",
+  "config": {
+    "command": "/usr/local/bin/opencode",
+    "args": ["acp"],
+    "env": {
+      "OPENAI_BASE_URL": "http://10.20.30.40:8000/v1",
+      "OLLAMA_HOST": "http://127.0.0.1:11434"
+    },
+    "initializeTimeoutMs": 10000,
+    "cancelGraceMs": 3000
+  }
+}
+```
+
+> **Izolacja Air-Gap:** Conductor automatycznie usuwa ze środowiska podprocesu ACP zmienne chmurowe (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN` itd.) oraz wstrzykuje flagi trybu offline (`CONDUCTOR_OFFLINE_MODE=1`, `DO_NOT_TRACK=1`, `HF_HUB_OFFLINE=1`).
+
 ---
 
 ## 7. Weryfikacja izolacji sieciowej

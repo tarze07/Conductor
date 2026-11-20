@@ -273,6 +273,10 @@ Ponieważ w sieci firmowej nie można polegać na zewnętrznych usługach typu C
      - **LiteLLM Proxy** (wewnętrzna bramka routująca i bilansująca obciążenie między lokalnymi modelami, np. `Qwen3-Coder-30B`, `DeepSeek-V3/R1`, `Llama-3.3-70B`, `Devstral`)
      - **Ollama / llama.cpp** (modele uruchamiane bezpośrednio na laptopie/stacji roboczej dewelopera, gdy pracuje całkowicie offline).
    - Fallback dla modeli bez natywnego wsparcia `tool_calls`: parser strukturalnych bloków XML/JSON umożliwiający korzystanie z mniejszych modeli lokalnych.
+4. **Adapter zgodny ze specyfikacją Agent Client Protocol v1 (`@conductor/provider-acp`):**
+   - Vendored offline schemat JSON (`schema/acp-schema-v1.json`) + generowane walidatory Zod (`src/schema/acp-v1.gen.ts`) i dwukierunkowa warstwa JSON-RPC 2.0 po `stdio` (`AcpJsonRpcConnection`).
+   - Jeden długowieczny proces na wątek (`AcpSessionRuntime`), negocjacja `initialize` (`protocolVersion`, `clientCapabilities`, `agentCapabilities`), trwałe `acpSessionId` w SQLite (`projections_threads.acp_session_id`) z wznawianiem `session/load`, mapowanie `session/update` (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`), dwukierunkowe `session/request_permission` (`selected` / `cancelled`), bezpieczne `fs/read_text_file` i `fs/write_text_file` z `resolveSafeWorkspacePath` oraz `session/cancel` z konfigurowalnym `cancelGraceMs`.
+   - Przykładowe podłączenie w sieci firmowej: `opencode acp` skierowany przez `env` na lokalny serwer **vLLM** / **Ollama**.
 
 ### 5.3. Checkpointing i Zarządzanie Drzewem Roboczym Git
 1. **Ukryte referencje Git (`CheckpointStore`):**

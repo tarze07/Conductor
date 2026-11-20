@@ -360,6 +360,22 @@ export class EventSink {
         break;
       }
 
+      case "thread.session.bound": {
+        this.store.db
+          .prepare(
+            `UPDATE projections_threads
+             SET acp_session_id = ?, last_event_seq = ?, updated_at = ?
+             WHERE thread_id = ?`
+          )
+          .run(
+            p.acpSessionId ? String(p.acpSessionId) : null,
+            event.seq,
+            event.createdAt,
+            String(p.threadId)
+          );
+        break;
+      }
+
       case "turn.started": {
         this.store.db
           .prepare(
@@ -577,7 +593,7 @@ export class EventSink {
       .prepare(
         `SELECT thread_id, project_id, title, provider_instance_id, model,
                 runtime_mode, status, last_event_seq, pruned_through_seq,
-                pull_requests_json, updated_at
+                pull_requests_json, acp_session_id, updated_at
          FROM projections_threads WHERE thread_id = ?`
       )
       .get(threadId) as
@@ -592,6 +608,7 @@ export class EventSink {
           last_event_seq: number;
           pruned_through_seq: number;
           pull_requests_json: string;
+          acp_session_id: string | null;
           updated_at: string;
         }
       | undefined;
@@ -611,6 +628,7 @@ export class EventSink {
       lastEventSeq: Number(row.last_event_seq),
       prunedThroughSeq: Number(row.pruned_through_seq),
       pullRequests: JSON.parse(row.pull_requests_json) as LinkedPullRequest[],
+      acpSessionId: row.acp_session_id ?? undefined,
       updatedAt: row.updated_at
     };
   }
@@ -622,7 +640,7 @@ export class EventSink {
             .prepare(
               `SELECT thread_id, project_id, title, provider_instance_id, model,
                       runtime_mode, status, last_event_seq, pruned_through_seq,
-                      pull_requests_json, updated_at
+                      pull_requests_json, acp_session_id, updated_at
                FROM projections_threads WHERE project_id = ? ORDER BY updated_at DESC`
             )
             .all(projectId)
@@ -630,7 +648,7 @@ export class EventSink {
             .prepare(
               `SELECT thread_id, project_id, title, provider_instance_id, model,
                       runtime_mode, status, last_event_seq, pruned_through_seq,
-                      pull_requests_json, updated_at
+                      pull_requests_json, acp_session_id, updated_at
                FROM projections_threads ORDER BY updated_at DESC`
             )
             .all()
@@ -645,6 +663,7 @@ export class EventSink {
       last_event_seq: number;
       pruned_through_seq: number;
       pull_requests_json: string;
+      acp_session_id: string | null;
       updated_at: string;
     }>;
 
@@ -659,6 +678,7 @@ export class EventSink {
       lastEventSeq: Number(row.last_event_seq),
       prunedThroughSeq: Number(row.pruned_through_seq),
       pullRequests: JSON.parse(row.pull_requests_json) as LinkedPullRequest[],
+      acpSessionId: row.acp_session_id ?? undefined,
       updatedAt: row.updated_at
     }));
   }

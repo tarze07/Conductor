@@ -10,6 +10,7 @@ import {
   type ProviderHost,
   type ProviderRegistry
 } from "@conductor/provider-core";
+import type { AuditLogger } from "../audit/AuditLogger.js";
 import type { CheckpointStore } from "../checkpointing/CheckpointStore.js";
 import type { EffectWorker } from "../orchestration-v2/EffectWorker.js";
 import type { OrchestratorV2 } from "../orchestration-v2/Orchestrator.js";
@@ -23,6 +24,7 @@ export interface ProviderTurnRunnerOptions {
   readonly registry: ProviderRegistry;
   readonly checkpointStore: CheckpointStore;
   readonly networkEvaluator?: NetworkPolicyEvaluator;
+  readonly auditLogger?: AuditLogger;
 }
 
 /**
@@ -38,6 +40,7 @@ export class ProviderTurnRunner {
   private readonly registry: ProviderRegistry;
   private readonly checkpointStore: CheckpointStore;
   private readonly networkEvaluator: NetworkPolicyEvaluator;
+  private readonly auditLogger?: AuditLogger;
   private readonly activeTurnControllers = new Map<string, AbortController>();
 
   constructor(options: ProviderTurnRunnerOptions) {
@@ -48,6 +51,7 @@ export class ProviderTurnRunner {
     this.registry = options.registry;
     this.checkpointStore = options.checkpointStore;
     this.networkEvaluator = options.networkEvaluator ?? new NetworkPolicyEvaluator();
+    this.auditLogger = options.auditLogger;
 
     this.registerEffectHandlers();
   }
@@ -99,7 +103,7 @@ export class ProviderTurnRunner {
     });
   }
 
-  public createHostForThread(): ProviderHost {
+  public createHostForThread(defaultThreadId?: string, defaultTurnId?: string): ProviderHost {
     return {
       emitStreamEvent: (ev) => {
         this.sink.appendStreamEvents([
@@ -170,7 +174,30 @@ export class ProviderTurnRunner {
         headers: {
           "T3-Mode-Limit": modeLimit
         }
-      })
+      }),
+      persistThreadSessionId: (threadId, sessionId) => {
+        this.sink.appendStreamEvents([
+          {
+            streamId: threadId,
+            type: "thread.session.bound",
+            payload: {
+              threadId,
+              acpSessionId: sessionId
+            },
+            createdAt: new Date().toISOString()
+          }
+        ]);
+      },
+      recordAuditEvent: (category, summary, metadata) => {
+        this.auditLogger?.logEvent(category, {
+          actor: "provider",
+          environmentId: this.environmentId,
+          threadId: defaultThreadId,
+          turnId: defaultTurnId,
+          summary,
+          metadata
+        });
+      }
     };
   }
 
@@ -265,12 +292,13 @@ export class ProviderTurnRunner {
     );
     const effectiveMode = resolveSupportedRuntimeMode(params.runtimeMode, adapter.presentation);
     const history = this.buildThreadHistory(threadId, turnId);
+    const threadProjection = this.sink.getThread(threadId);
 
     const key = this.turnKey(threadId, turnId);
     const controller = new AbortController();
     this.activeTurnControllers.set(key, controller);
 
-    const host = this.createHostForThread();
+    const host = this.createHostForThread(threadId, turnId);
 
     try {
       const outcome = await adapter.runTurn(
@@ -282,6 +310,7 @@ export class ProviderTurnRunner {
           prompt,
           model: effectiveModel,
           runtimeMode: effectiveMode,
+          acpSessionId: threadProjection?.acpSessionId,
           history
         },
         host,

@@ -129,8 +129,11 @@ export const OrchestrationEventTypeSchema = z.enum([
   "project.registered",
   "thread.created",
   "thread.settled",
+  "thread.session.bound",
   "turn.started",
   "message.delta",
+  "reasoning.delta",
+  "plan.updated",
   "tool.call.started",
   "tool.call.completed",
   "runtime-request.opened",
@@ -188,6 +191,7 @@ export const ThreadProjectionSchema = z.object({
   lastEventSeq: z.number().int().nonnegative(),
   prunedThroughSeq: z.number().int().nonnegative().default(0),
   pullRequests: z.array(LinkedPullRequestSchema).default([]),
+  acpSessionId: z.string().optional(),
   updatedAt: z.string().datetime()
 });
 export type ThreadProjection = z.infer<typeof ThreadProjectionSchema>;
