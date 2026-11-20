@@ -13,7 +13,14 @@ export interface ComposerFileReference {
 
 export interface TimelineItem {
   readonly id: string;
-  readonly kind: "user_prompt" | "assistant_message" | "tool_call" | "runtime_request" | "checkpoint";
+  readonly kind:
+    | "user_prompt"
+    | "assistant_message"
+    | "reasoning"
+    | "plan"
+    | "tool_call"
+    | "runtime_request"
+    | "checkpoint";
   readonly turnId: string;
   readonly title: string;
   readonly body: string;
@@ -67,6 +74,8 @@ export function buildThreadTimelineFromEvents(
 ): readonly TimelineItem[] {
   const items: TimelineItem[] = [];
   const assistantIndexByTurn = new Map<string, number>();
+  const reasoningIndexByTurn = new Map<string, number>();
+  const planIndexByTurn = new Map<string, number>();
   const toolCallIndexById = new Map<string, number>();
   const requestIndexById = new Map<string, number>();
 
@@ -108,6 +117,58 @@ export function buildThreadTimelineFromEvents(
         break;
       }
 
+      case "reasoning.delta": {
+        const delta = String(p.textDelta ?? "");
+        const existingIdx = reasoningIndexByTurn.get(turnId);
+        if (existingIdx !== undefined) {
+          const prev = items[existingIdx]!;
+          items[existingIdx] = {
+            ...prev,
+            body: prev.body + delta
+          };
+        } else {
+          reasoningIndexByTurn.set(turnId, items.length);
+          items.push({
+            id: `reasoning_${turnId}`,
+            kind: "reasoning",
+            turnId,
+            title: "Rozumowanie agenta",
+            body: delta
+          });
+        }
+        break;
+      }
+
+      case "plan.updated": {
+        const entries = Array.isArray(p.entries)
+          ? (p.entries as Array<{ content?: string; priority?: string; status?: string }>)
+          : [];
+        const formatted = entries
+          .map(
+            (e) =>
+              `[${String(e.status ?? "pending")}] (${String(e.priority ?? "medium")}) ${String(e.content ?? "")}`
+          )
+          .join("\n");
+        const existingIdx = planIndexByTurn.get(turnId);
+        if (existingIdx !== undefined) {
+          const prev = items[existingIdx]!;
+          items[existingIdx] = {
+            ...prev,
+            body: formatted
+          };
+        } else {
+          planIndexByTurn.set(turnId, items.length);
+          items.push({
+            id: `plan_${turnId}`,
+            kind: "plan",
+            turnId,
+            title: "Plan zadań agenta",
+            body: formatted
+          });
+        }
+        break;
+      }
+
       case "tool.call.started": {
         const toolCallId = String(p.toolCallId ?? `tc_${ev.seq}`);
         const toolName = String(p.toolName ?? "tool");
@@ -125,13 +186,14 @@ export function buildThreadTimelineFromEvents(
 
       case "tool.call.completed": {
         const toolCallId = String(p.toolCallId ?? "");
+        const status = String(p.status ?? "completed");
         const idx = toolCallIndexById.get(toolCallId);
         if (idx !== undefined) {
           const prev = items[idx]!;
           items[idx] = {
             ...prev,
             body: `${prev.body}\n→ Wynik: ${JSON.stringify(p.result ?? {})}`,
-            status: "completed"
+            status
           };
         }
         break;

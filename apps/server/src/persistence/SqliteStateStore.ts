@@ -82,6 +82,7 @@ export class SqliteStateStore {
         pull_requests_json TEXT NOT NULL DEFAULT '[]',
         worktree_branch TEXT,
         link_origin_json TEXT,
+        acp_session_id TEXT,
         updated_at TEXT NOT NULL
       );
 
@@ -136,6 +137,13 @@ export class SqliteStateStore {
         consumed INTEGER NOT NULL DEFAULT 0
       );
     `);
+
+    // Ensure existing SQLite files created before ACP session persistence have acp_session_id
+    try {
+      this.db.exec(`ALTER TABLE projections_threads ADD COLUMN acp_session_id TEXT;`);
+    } catch {
+      // Column already exists
+    }
   }
 
   public inTransaction<T>(fn: () => T): T {

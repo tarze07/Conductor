@@ -1,54 +1,109 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { DEFAULT_MODEL_SENTINEL, type ProviderPresentation } from "@conductor/contracts";
 import { sanitizeSubprocessEnv } from "@conductor/network-guard";
-import {
-  resolveEffectiveModel,
-  resolveSupportedRuntimeMode,
-  type ProviderAdapterV2,
-  type ProviderDriver,
-  type ProviderHost,
-  type ProviderStatusReport,
-  type ProviderTurnInput,
-  type ProviderTurnOutcome
-} from "@conductor/provider-core/server";
+import type {
+  ProviderAdapterV2,
+  ProviderDriver,
+  ProviderHost,
+  ProviderStatusReport,
+  ProviderTurnInput,
+  ProviderTurnOutcome
+} from "@conductor/provider-core";
+import { AcpSessionRuntime } from "./session-runtime.js";
 import {
   ACP_PROVIDER_PRESENTATION,
+  deriveAcpPresentationFromSessionModes,
   type AcpProviderSettings
 } from "./settings.js";
 
-interface JsonRpcFrame {
-  readonly jsonrpc: "2.0";
-  readonly id?: string | number;
-  readonly method?: string;
-  readonly params?: Record<string, unknown>;
-  readonly result?: Record<string, unknown>;
-  readonly error?: { readonly code: number; readonly message: string };
+export interface AcpAdapterFrameObserver {
+  readonly onOutboundFrame?: (frame: Record<string, unknown>, threadId: string) => void;
+  readonly onInboundFrame?: (frame: Record<string, unknown>, threadId: string) => void;
 }
 
+/**
+ * Specification-compliant Agent Client Protocol (ACP) v1 ProviderAdapterV2.
+ *
+ * Maintains a pool of long-lived `AcpSessionRuntime` child processes keyed by `threadId`
+ * so multi-turn conversations reuse the same process and `sessionId`, and supports
+ * `session/load` resumption across server restarts.
+ */
 export class AcpProviderAdapter implements ProviderAdapterV2<AcpProviderSettings> {
   public readonly instanceSettings: AcpProviderSettings;
-  public readonly presentation = ACP_PROVIDER_PRESENTATION;
-  private readonly activeProcesses = new Map<string, ChildProcessWithoutNullStreams>();
+  private currentPresentation: ProviderPresentation = ACP_PROVIDER_PRESENTATION;
+  private readonly sessions = new Map<string, AcpSessionRuntime>();
+  private readonly frameObserver?: AcpAdapterFrameObserver;
 
-  constructor(instanceSettings: AcpProviderSettings) {
+  constructor(instanceSettings: AcpProviderSettings, frameObserver?: AcpAdapterFrameObserver) {
     this.instanceSettings = instanceSettings;
+    this.frameObserver = frameObserver;
   }
 
-  /**
-   * Status check verifies binary configurability without opening an interactive session
-   * or triggering external hooks (matching t3code's `providers.md` rule).
-   */
+  public get presentation(): ProviderPresentation {
+    return this.currentPresentation;
+  }
+
+  public getSessionRuntime(threadId: string): AcpSessionRuntime | undefined {
+    return this.sessions.get(threadId);
+  }
+
+  public listActiveThreadIds(): readonly string[] {
+    return [...this.sessions.keys()];
+  }
+
   public async probeStatus(): Promise<ProviderStatusReport> {
-    return {
-      instanceId: this.instanceSettings.instanceId,
-      driverKind: "acp",
-      healthy: Boolean(this.instanceSettings.config.command),
-      availableModels: [
-        this.instanceSettings.defaultModel === "__DEFAULT_MODEL__"
-          ? "acp-local-default"
-          : this.instanceSettings.defaultModel
-      ]
-    };
+    const cmd = this.instanceSettings.config.command;
+    const resolvedModel =
+      this.instanceSettings.defaultModel !== DEFAULT_MODEL_SENTINEL
+        ? this.instanceSettings.defaultModel
+        : "acp-local-default";
+
+    if (cmd.startsWith("/") || cmd.startsWith("./") || cmd.startsWith("../") || /^[A-Za-z]:\\/.test(cmd)) {
+      const exists = existsSync(cmd);
+      return {
+        instanceId: this.instanceSettings.instanceId,
+        driverKind: "acp",
+        healthy: exists,
+        availableModels: [resolvedModel],
+        detail: exists ? `Binary found at ${cmd}` : `Binary not found at ${cmd}`
+      };
+    }
+
+    return new Promise<ProviderStatusReport>((resolve) => {
+      const child = spawn(cmd, ["--version"], {
+        env: sanitizeSubprocessEnv(
+          {
+            ...process.env,
+            ...this.instanceSettings.config.env
+          },
+          {
+            caBundlePath: this.instanceSettings.caBundlePath
+          }
+        ),
+        stdio: "ignore"
+      });
+
+      child.on("error", (err) => {
+        resolve({
+          instanceId: this.instanceSettings.instanceId,
+          driverKind: "acp",
+          healthy: false,
+          availableModels: [],
+          detail: err.message
+        });
+      });
+
+      child.on("close", (code) => {
+        resolve({
+          instanceId: this.instanceSettings.instanceId,
+          driverKind: "acp",
+          healthy: code === 0,
+          availableModels: [resolvedModel],
+          detail: code === 0 ? "ACP CLI ready" : `ACP CLI exited with code ${String(code)}`
+        });
+      });
+    });
   }
 
   public async runTurn(
@@ -56,245 +111,54 @@ export class AcpProviderAdapter implements ProviderAdapterV2<AcpProviderSettings
     host: ProviderHost,
     signal: AbortSignal
   ): Promise<ProviderTurnOutcome> {
-    if (signal.aborted) {
-      return {
-        status: "cancelled",
-        assistantText: "",
-        toolCallsCount: 0
-      };
+    let runtime = this.sessions.get(input.threadId);
+    if (!runtime) {
+      runtime = new AcpSessionRuntime({
+        threadId: input.threadId,
+        settings: this.instanceSettings,
+        onOutboundFrame: this.frameObserver?.onOutboundFrame
+          ? (frame) => this.frameObserver?.onOutboundFrame?.(frame, input.threadId)
+          : undefined,
+        onInboundFrame: this.frameObserver?.onInboundFrame
+          ? (frame) => this.frameObserver?.onInboundFrame?.(frame, input.threadId)
+          : undefined
+      });
+      this.sessions.set(input.threadId, runtime);
     }
 
-    const effectiveModel = resolveEffectiveModel(
-      input.model,
-      this.instanceSettings,
-      "acp-local-default"
-    );
-    const effectiveMode = resolveSupportedRuntimeMode(input.runtimeMode, this.presentation);
+    const outcome = await runtime.runTurn(input, host, signal);
 
-    const mcpBridge = host.getThreadMcpEndpoint?.(input.threadId, effectiveMode);
-    const sanitizedEnv = sanitizeSubprocessEnv(process.env, {
-      allowedEnvKeys: this.instanceSettings.config.allowedEnvKeys,
-      caBundlePath: this.instanceSettings.caBundlePath,
-      overrides: {
-        CONDUCTOR_THREAD_ID: input.threadId,
-        CONDUCTOR_RUNTIME_MODE: effectiveMode,
-        ...(mcpBridge ? { CONDUCTOR_MCP_URL: mcpBridge.url } : {})
-      }
-    });
+    const modes = runtime.getSessionModes();
+    if (modes) {
+      this.currentPresentation = deriveAcpPresentationFromSessionModes(
+        ACP_PROVIDER_PRESENTATION,
+        modes
+      );
+    }
 
-    const turnKey = `${input.threadId}:${input.turnId}`;
-    const child = spawn(
-      this.instanceSettings.config.command,
-      this.instanceSettings.config.args,
-      {
-        cwd: input.workspaceRoot,
-        env: sanitizedEnv,
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
+    return outcome;
+  }
 
-    this.activeProcesses.set(turnKey, child);
-
-    let assistantText = "";
-    let toolCallsCount = 0;
-    let settled = false;
-
-    const sendFrame = (frame: JsonRpcFrame): void => {
-      if (!child.killed && child.stdin.writable) {
-        child.stdin.write(`${JSON.stringify(frame)}\n`);
-      }
-    };
-
-    const onAbort = (): void => {
-      sendFrame({
-        jsonrpc: "2.0",
-        method: "session/cancel",
-        params: { threadId: input.threadId, turnId: input.turnId }
-      });
-      child.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-
-    try {
-      return await new Promise<ProviderTurnOutcome>((resolveOutcome) => {
-        const rl = createInterface({ input: child.stdout });
-
-        const finish = (outcome: ProviderTurnOutcome): void => {
-          if (settled) {
-            return;
-          }
-          settled = true;
-          rl.close();
-          if (!child.killed) {
-            child.kill("SIGTERM");
-          }
-          resolveOutcome(outcome);
-        };
-
-        rl.on("line", (line) => {
-          const trimmed = line.trim();
-          if (!trimmed) {
-            return;
-          }
-          let frame: JsonRpcFrame;
-          try {
-            frame = JSON.parse(trimmed) as JsonRpcFrame;
-          } catch {
-            return;
-          }
-
-          if (frame.method === "session/update" && frame.params) {
-            const p = frame.params;
-            if (p.updateType === "delta" && typeof p.textDelta === "string") {
-              assistantText += p.textDelta;
-              host.emitStreamEvent({
-                streamId: input.threadId,
-                type: "message.delta",
-                payload: {
-                  threadId: input.threadId,
-                  turnId: input.turnId,
-                  textDelta: p.textDelta
-                }
-              });
-            } else if (p.updateType === "tool_call") {
-              toolCallsCount += 1;
-              host.emitStreamEvent({
-                streamId: input.threadId,
-                type: "tool.call.started",
-                payload: {
-                  threadId: input.threadId,
-                  turnId: input.turnId,
-                  toolCallId: String(p.toolCallId ?? `acp_tc_${toolCallsCount}`),
-                  toolName: String(p.toolName ?? "acp_tool"),
-                  args: (p.args as Record<string, unknown>) ?? {}
-                }
-              });
-              host.emitStreamEvent({
-                streamId: input.threadId,
-                type: "tool.call.completed",
-                payload: {
-                  threadId: input.threadId,
-                  turnId: input.turnId,
-                  toolCallId: String(p.toolCallId ?? `acp_tc_${toolCallsCount}`),
-                  toolName: String(p.toolName ?? "acp_tool"),
-                  result: (p.result as Record<string, unknown>) ?? {}
-                }
-              });
-            }
-            return;
-          }
-
-          if (frame.method === "session/request_permission" && frame.params && frame.id !== undefined) {
-            const p = frame.params;
-            const requestId = String(p.requestId ?? `acp_perm_${frame.id}`);
-            const options =
-              (p.options as Array<{ id: string; label: string }>) ?? [
-                { id: "allow", label: "Allow" },
-                { id: "decline", label: "Decline" }
-              ];
-            void host
-              .requestApproval(
-                {
-                  requestId,
-                  threadId: input.threadId,
-                  turnId: input.turnId,
-                  question: String(p.question ?? "Approve ACP tool action?"),
-                  options
-                },
-                signal
-              )
-              .then((res) => {
-                sendFrame({
-                  jsonrpc: "2.0",
-                  id: frame.id,
-                  result: { selectedOptionId: res.selectedOptionId }
-                });
-              })
-              .catch(() => {
-                sendFrame({
-                  jsonrpc: "2.0",
-                  id: frame.id,
-                  result: { selectedOptionId: "decline" }
-                });
-              });
-            return;
-          }
-
-          if (frame.id === "req_prompt" && frame.result) {
-            const status =
-              (frame.result.status as ProviderTurnOutcome["status"]) ?? "completed";
-            finish({
-              status,
-              assistantText:
-                typeof frame.result.assistantText === "string"
-                  ? frame.result.assistantText
-                  : assistantText,
-              toolCallsCount
-            });
-          } else if (frame.id === "req_prompt" && frame.error) {
-            finish({
-              status: "failed",
-              assistantText,
-              toolCallsCount,
-              errorMessage: frame.error.message
-            });
-          }
-        });
-
-        child.on("close", (code) => {
-          if (!settled) {
-            if (signal.aborted) {
-              finish({
-                status: "cancelled",
-                assistantText,
-                toolCallsCount
-              });
-            } else {
-              finish({
-                status: code === 0 ? "completed" : "failed",
-                assistantText,
-                toolCallsCount,
-                errorMessage: code === 0 ? undefined : `ACP subprocess exited with code ${code}`
-              });
-            }
-          }
-        });
-
-        // Send ACP initialize + session/prompt frames
-        sendFrame({
-          jsonrpc: "2.0",
-          id: "req_init",
-          method: "initialize",
-          params: {
-            protocolVersion: 1,
-            flavor: this.instanceSettings.config.flavor,
-            mcpEntryName: `conductor-${input.threadId}`
-          }
-        });
-
-        sendFrame({
-          jsonrpc: "2.0",
-          id: "req_prompt",
-          method: "session/prompt",
-          params: {
-            threadId: input.threadId,
-            turnId: input.turnId,
-            prompt: input.prompt,
-            model: effectiveModel,
-            runtimeMode: effectiveMode
-          }
-        });
-      });
-    } finally {
-      signal.removeEventListener("abort", onAbort);
-      this.activeProcesses.delete(turnKey);
+  public async cancelTurn(threadId: string, _turnId: string): Promise<void> {
+    const runtime = this.sessions.get(threadId);
+    if (runtime) {
+      await runtime.cancelActiveTurn();
     }
   }
 
-  public async cancelTurn(threadId: string, turnId: string): Promise<void> {
-    const child = this.activeProcesses.get(`${threadId}:${turnId}`);
-    if (child && !child.killed) {
-      child.kill("SIGTERM");
+  public async closeSession(threadId: string): Promise<void> {
+    const runtime = this.sessions.get(threadId);
+    if (runtime) {
+      this.sessions.delete(threadId);
+      await runtime.close();
+    }
+  }
+
+  public async closeAll(): Promise<void> {
+    const runtimes = [...this.sessions.values()];
+    this.sessions.clear();
+    for (const runtime of runtimes) {
+      await runtime.close();
     }
   }
 }
@@ -303,7 +167,5 @@ export const acpProviderDriver: ProviderDriver<AcpProviderSettings> = {
   driverKind: "acp",
   presentation: ACP_PROVIDER_PRESENTATION,
   fallbackDefaultModel: "acp-local-default",
-  createAdapter(settings) {
-    return new AcpProviderAdapter(settings);
-  }
+  createAdapter: (settings) => new AcpProviderAdapter(settings)
 };

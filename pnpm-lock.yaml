@@ -190,6 +190,9 @@ importers:
 
   packages/provider-acp:
     dependencies:
+      '@conductor/agent-core':
+        specifier: workspace:*
+        version: link:../agent-core
       '@conductor/contracts':
         specifier: workspace:*
         version: link:../contracts

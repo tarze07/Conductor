@@ -1,0 +1,375 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentclientprotocol.com/schemas/v1/acp-schema-v1.json",
+  "title": "Agent Client Protocol (ACP) v1 Schema",
+  "description": "Vendored offline JSON Schema for Agent Client Protocol v1 messages over newline-delimited JSON-RPC 2.0 stdio.",
+  "protocolVersion": 1,
+  "definitions": {
+    "ProtocolVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ClientCapabilities": {
+      "type": "object",
+      "properties": {
+        "fs": {
+          "type": "object",
+          "properties": {
+            "readTextFile": { "type": "boolean" },
+            "writeTextFile": { "type": "boolean" }
+          }
+        },
+        "terminal": { "type": "boolean" }
+      }
+    },
+    "AgentCapabilities": {
+      "type": "object",
+      "properties": {
+        "loadSession": { "type": "boolean" },
+        "promptCapabilities": {
+          "type": "object",
+          "properties": {
+            "image": { "type": "boolean" },
+            "audio": { "type": "boolean" },
+            "embeddedContext": { "type": "boolean" }
+          }
+        },
+        "mcpCapabilities": {
+          "type": "object",
+          "properties": {
+            "http": { "type": "boolean" },
+            "sse": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "AuthMethod": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": ["string", "null"] }
+      }
+    },
+    "InitializeRequest": {
+      "type": "object",
+      "required": ["protocolVersion"],
+      "properties": {
+        "protocolVersion": { "$ref": "#/definitions/ProtocolVersion" },
+        "clientCapabilities": { "$ref": "#/definitions/ClientCapabilities" },
+        "clientInfo": {
+          "type": "object",
+          "required": ["name", "version"],
+          "properties": {
+            "name": { "type": "string" },
+            "title": { "type": "string" },
+            "version": { "type": "string" }
+          }
+        }
+      }
+    },
+    "InitializeResponse": {
+      "type": "object",
+      "required": ["protocolVersion"],
+      "properties": {
+        "protocolVersion": { "$ref": "#/definitions/ProtocolVersion" },
+        "agentCapabilities": { "$ref": "#/definitions/AgentCapabilities" },
+        "authMethods": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/AuthMethod" }
+        },
+        "agentInfo": {
+          "type": "object",
+          "required": ["name", "version"],
+          "properties": {
+            "name": { "type": "string" },
+            "title": { "type": "string" },
+            "version": { "type": "string" }
+          }
+        }
+      }
+    },
+    "AuthenticateRequest": {
+      "type": "object",
+      "required": ["methodId"],
+      "properties": {
+        "methodId": { "type": "string" }
+      }
+    },
+    "AuthenticateResponse": {
+      "type": "object"
+    },
+    "McpServerStdio": {
+      "type": "object",
+      "required": ["name", "command", "args"],
+      "properties": {
+        "type": { "const": "stdio" },
+        "name": { "type": "string" },
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "value"],
+            "properties": {
+              "name": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "McpServerHttp": {
+      "type": "object",
+      "required": ["type", "name", "url", "headers"],
+      "properties": {
+        "type": { "enum": ["http", "sse"] },
+        "name": { "type": "string" },
+        "url": { "type": "string" },
+        "headers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "value"],
+            "properties": {
+              "name": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "SessionModeState": {
+      "type": "object",
+      "required": ["currentModeId", "availableModes"],
+      "properties": {
+        "currentModeId": { "type": "string" },
+        "availableModes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name"],
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "description": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "NewSessionRequest": {
+      "type": "object",
+      "required": ["cwd", "mcpServers"],
+      "properties": {
+        "cwd": { "type": "string" },
+        "mcpServers": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/definitions/McpServerHttp" },
+              { "$ref": "#/definitions/McpServerStdio" }
+            ]
+          }
+        }
+      }
+    },
+    "NewSessionResponse": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "modes": { "$ref": "#/definitions/SessionModeState" }
+      }
+    },
+    "LoadSessionRequest": {
+      "type": "object",
+      "required": ["sessionId", "cwd", "mcpServers"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "cwd": { "type": "string" },
+        "mcpServers": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/definitions/McpServerHttp" },
+              { "$ref": "#/definitions/McpServerStdio" }
+            ]
+          }
+        }
+      }
+    },
+    "LoadSessionResponse": {
+      "type": "object",
+      "properties": {
+        "modes": { "$ref": "#/definitions/SessionModeState" }
+      }
+    },
+    "SetSessionModeRequest": {
+      "type": "object",
+      "required": ["sessionId", "modeId"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "modeId": { "type": "string" }
+      }
+    },
+    "ContentBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "const": "text" },
+            "text": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "uri", "name"],
+          "properties": {
+            "type": { "const": "resource_link" },
+            "uri": { "type": "string" },
+            "name": { "type": "string" },
+            "mimeType": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "resource"],
+          "properties": {
+            "type": { "const": "resource" },
+            "resource": {
+              "type": "object",
+              "required": ["uri", "text"],
+              "properties": {
+                "uri": { "type": "string" },
+                "text": { "type": "string" },
+                "mimeType": { "type": "string" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "StopReason": {
+      "type": "string",
+      "enum": ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"]
+    },
+    "PromptRequest": {
+      "type": "object",
+      "required": ["sessionId", "prompt"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "prompt": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ContentBlock" }
+        }
+      }
+    },
+    "PromptResponse": {
+      "type": "object",
+      "required": ["stopReason"],
+      "properties": {
+        "stopReason": { "$ref": "#/definitions/StopReason" }
+      }
+    },
+    "CancelNotification": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": {
+        "sessionId": { "type": "string" }
+      }
+    },
+    "PermissionOptionKind": {
+      "type": "string",
+      "enum": ["allow_once", "allow_always", "reject_once", "reject_always"]
+    },
+    "PermissionOption": {
+      "type": "object",
+      "required": ["optionId", "name", "kind"],
+      "properties": {
+        "optionId": { "type": "string" },
+        "name": { "type": "string" },
+        "kind": { "$ref": "#/definitions/PermissionOptionKind" }
+      }
+    },
+    "RequestPermissionRequest": {
+      "type": "object",
+      "required": ["sessionId", "toolCall", "options"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "toolCall": {
+          "type": "object",
+          "required": ["toolCallId"],
+          "properties": {
+            "toolCallId": { "type": "string" },
+            "title": { "type": "string" },
+            "kind": { "type": "string" },
+            "status": { "type": "string" },
+            "rawInput": {}
+          }
+        },
+        "options": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/PermissionOption" }
+        }
+      }
+    },
+    "RequestPermissionResponse": {
+      "type": "object",
+      "required": ["outcome"],
+      "properties": {
+        "outcome": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["outcome"],
+              "properties": {
+                "outcome": { "const": "cancelled" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["outcome", "optionId"],
+              "properties": {
+                "outcome": { "const": "selected" },
+                "optionId": { "type": "string" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ReadTextFileRequest": {
+      "type": "object",
+      "required": ["sessionId", "path"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "path": { "type": "string" },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "limit": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "ReadTextFileResponse": {
+      "type": "object",
+      "required": ["content"],
+      "properties": {
+        "content": { "type": "string" }
+      }
+    },
+    "WriteTextFileRequest": {
+      "type": "object",
+      "required": ["sessionId", "path", "content"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "path": { "type": "string" },
+        "content": { "type": "string" }
+      }
+    },
+    "WriteTextFileResponse": {
+      "type": "object"
+    }
+  }
+}

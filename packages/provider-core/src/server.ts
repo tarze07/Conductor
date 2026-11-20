@@ -14,6 +14,7 @@ export interface ProviderTurnInput {
   readonly prompt: string;
   readonly model: string;
   readonly runtimeMode: RuntimeMode;
+  readonly acpSessionId?: string;
   readonly history?: readonly {
     readonly role: "user" | "assistant";
     readonly content: string;
@@ -29,12 +30,24 @@ export interface ProviderTurnOutcome {
   readonly hasPendingBackgroundWork?: boolean;
 }
 
+export type ProviderApprovalOptionKind =
+  | "allow_once"
+  | "allow_always"
+  | "reject_once"
+  | "reject_always";
+
+export interface ProviderApprovalOption {
+  readonly id: string;
+  readonly label: string;
+  readonly kind?: ProviderApprovalOptionKind;
+}
+
 export interface ProviderApprovalRequest {
   readonly requestId: string;
   readonly threadId: string;
   readonly turnId: string;
   readonly question: string;
-  readonly options: readonly { readonly id: string; readonly label: string }[];
+  readonly options: readonly ProviderApprovalOption[];
 }
 
 export interface ProviderApprovalResolution {
@@ -58,6 +71,12 @@ export interface ProviderHost {
     readonly url: string;
     readonly headers: Readonly<Record<string, string>>;
   };
+  persistThreadSessionId?(threadId: string, sessionId: string): void;
+  recordAuditEvent?(
+    category: "agent.file_edit" | "agent.approval" | "agent.terminal_command" | "agent.prompt",
+    summary: string,
+    metadata?: Readonly<Record<string, unknown>>
+  ): void;
 }
 
 export interface ProviderStatusReport {
@@ -80,6 +99,8 @@ export interface ProviderAdapterV2<
     signal: AbortSignal
   ): Promise<ProviderTurnOutcome>;
   cancelTurn(threadId: string, turnId: string): Promise<void>;
+  closeSession?(threadId: string): Promise<void>;
+  closeAll?(): Promise<void>;
 }
 
 export interface ProviderDriver<
@@ -148,6 +169,10 @@ export class ProviderRegistry {
     if (!driver) {
       throw new Error(`Provider driver '${settings.driverKind}' is not registered`);
     }
+    const existing = this.instances.get(settings.instanceId);
+    if (existing?.closeAll) {
+      void existing.closeAll();
+    }
     const adapter = driver.createAdapter(settings) as ProviderAdapterV2<TSettings>;
     this.instances.set(settings.instanceId, adapter);
     return adapter;
@@ -158,7 +183,19 @@ export class ProviderRegistry {
   }
 
   public removeInstance(instanceId: string): boolean {
+    const existing = this.instances.get(instanceId);
+    if (existing?.closeAll) {
+      void existing.closeAll();
+    }
     return this.instances.delete(instanceId);
+  }
+
+  public async closeAllInstances(): Promise<void> {
+    for (const adapter of this.instances.values()) {
+      if (adapter.closeAll) {
+        await adapter.closeAll();
+      }
+    }
   }
 
   public listInstances(): readonly ProviderAdapterV2[] {

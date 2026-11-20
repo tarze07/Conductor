@@ -474,36 +474,168 @@ describe("Phase 3 — AcpProviderAdapter over stdio JSON-RPC 2.0 with sanitized 
     const acpSettings = createMockAcpInstanceSettings("acp-local-1");
     const adapter = registry.registerInstance(acpSettings);
 
-    const status = await adapter.probeStatus();
-    expect(status.healthy).toBe(true);
+    try {
+      const status = await adapter.probeStatus();
+      expect(status.healthy).toBe(true);
 
-    const emittedDeltas: string[] = [];
-    const outcome = await adapter.runTurn(
-      {
-        threadId: "thr_acp",
-        turnId: "turn_acp_1",
-        projectId: "proj_acp",
-        workspaceRoot: process.cwd(),
-        prompt: "Sprawdź środowisko ACP",
-        model: "acp-local-model",
-        runtimeMode: "supervised"
-      },
-      {
-        emitStreamEvent: (ev) => {
-          if (ev.type === "message.delta" && typeof ev.payload.textDelta === "string") {
-            emittedDeltas.push(ev.payload.textDelta);
-          }
+      const emittedDeltas: string[] = [];
+      const outcome = await adapter.runTurn(
+        {
+          threadId: "thr_acp",
+          turnId: "turn_acp_1",
+          projectId: "proj_acp",
+          workspaceRoot: process.cwd(),
+          prompt: "Sprawdź środowisko ACP",
+          model: "acp-local-model",
+          runtimeMode: "supervised"
         },
-        requestApproval: async () => ({ selectedOptionId: "allow" }),
-        verifyOutboundUrl: async () => {}
-      },
-      new AbortController().signal
-    );
+        {
+          emitStreamEvent: (ev) => {
+            if (ev.type === "message.delta" && typeof ev.payload.textDelta === "string") {
+              emittedDeltas.push(ev.payload.textDelta);
+            }
+          },
+          requestApproval: async () => ({ selectedOptionId: "allow" }),
+          verifyOutboundUrl: async () => {}
+        },
+        new AbortController().signal
+      );
 
-    expect(outcome.status).toBe("completed");
-    expect(emittedDeltas.join("")).toContain("ACP offline response (CLEAN)");
+      expect(outcome.status).toBe("completed");
+      expect(emittedDeltas.join("")).toContain("ACP offline response (CLEAN, OFFLINE=1)");
+    } finally {
+      await adapter.closeAll?.();
+      delete process.env.OPENAI_API_KEY;
+    }
+  });
 
-    delete process.env.OPENAI_API_KEY;
+  it("persists acpSessionId in SQLite projections_threads and resumes via session/load after server restart", async () => {
+    const dbDir = mkdtempSync(join(tmpdir(), "conductor-acp-sqlite-"));
+    const dbPath = join(dbDir, "statev2.sqlite");
+    const wsDir = mkdtempSync(join(tmpdir(), "conductor-acp-ws-"));
+
+    try {
+      // 1. First server lifecycle: run turn 1, verify acpSessionId is stored in SQLite
+      const store1 = new SqliteStateStore({ dbPath });
+      const sink1 = new EventSink(store1);
+      const orchestrator1 = new OrchestratorV2(sink1);
+      const worker1 = new EffectWorker(store1);
+      orchestrator1.attachEffectWorker(worker1);
+
+      const registry1 = new ProviderRegistry();
+      registry1.registerDriver(acpProviderDriver);
+      registry1.registerInstance(createMockAcpInstanceSettings("acp-persistent-1"));
+
+      new ProviderTurnRunner({
+        environmentId: "env_acp",
+        sink: sink1,
+        orchestrator: orchestrator1,
+        effectWorker: worker1,
+        registry: registry1,
+        checkpointStore: new CheckpointStore()
+      });
+
+      orchestrator1.dispatch({
+        commandId: "cmd_acp_proj",
+        environmentId: "env_acp",
+        issuedAt: "2026-11-12T10:00:00.000Z",
+        type: "project.register",
+        payload: {
+          projectId: "proj_acp_persist",
+          name: "ACP Persist Project",
+          rootPath: wsDir,
+          defaultBranch: "main"
+        }
+      });
+
+      orchestrator1.dispatch({
+        commandId: "cmd_acp_thr",
+        environmentId: "env_acp",
+        issuedAt: "2026-11-12T10:00:01.000Z",
+        type: "thread.create",
+        payload: {
+          threadId: "thr_acp_persist",
+          projectId: "proj_acp_persist",
+          title: "Persistent ACP Thread",
+          providerInstanceId: "acp-persistent-1",
+          model: DEFAULT_MODEL_SENTINEL,
+          runtimeMode: "supervised"
+        }
+      });
+
+      orchestrator1.dispatch({
+        commandId: "cmd_acp_turn_1",
+        environmentId: "env_acp",
+        issuedAt: "2026-11-12T10:00:02.000Z",
+        type: "turn.start",
+        payload: {
+          threadId: "thr_acp_persist",
+          turnId: "turn_acp_p1",
+          prompt: "Pierwsza tura przed restartem",
+          attachmentIds: []
+        }
+      });
+
+      await worker1.drain();
+
+      const threadAfterTurn1 = sink1.getThread("thr_acp_persist");
+      expect(threadAfterTurn1?.acpSessionId).toBeDefined();
+      const savedSessionId = threadAfterTurn1!.acpSessionId!;
+
+      await registry1.closeAllInstances();
+      store1.close();
+
+      // 2. Second server lifecycle: reopen SQLite database, run turn 2, verify same acpSessionId is loaded
+      const store2 = new SqliteStateStore({ dbPath });
+      const sink2 = new EventSink(store2);
+      const orchestrator2 = new OrchestratorV2(sink2);
+      const worker2 = new EffectWorker(store2);
+      orchestrator2.attachEffectWorker(worker2);
+
+      const registry2 = new ProviderRegistry();
+      registry2.registerDriver(acpProviderDriver);
+      registry2.registerInstance(createMockAcpInstanceSettings("acp-persistent-1"));
+
+      new ProviderTurnRunner({
+        environmentId: "env_acp",
+        sink: sink2,
+        orchestrator: orchestrator2,
+        effectWorker: worker2,
+        registry: registry2,
+        checkpointStore: new CheckpointStore()
+      });
+
+      expect(sink2.getThread("thr_acp_persist")?.acpSessionId).toBe(savedSessionId);
+
+      orchestrator2.dispatch({
+        commandId: "cmd_acp_turn_2",
+        environmentId: "env_acp",
+        issuedAt: "2026-11-12T10:01:00.000Z",
+        type: "turn.start",
+        payload: {
+          threadId: "thr_acp_persist",
+          turnId: "turn_acp_p2",
+          prompt: "Druga tura po restarcie serwera",
+          attachmentIds: []
+        }
+      });
+
+      await worker2.drain();
+
+      expect(sink2.getTurn("turn_acp_p2")?.status).toBe("completed");
+      const events = sink2.getEventsForStream("thr_acp_persist", 0);
+      const turn2Deltas = events
+        .filter((e) => e.type === "message.delta" && e.payload.turnId === "turn_acp_p2")
+        .map((e) => String(e.payload.textDelta))
+        .join("");
+      expect(turn2Deltas).toContain(`session=${savedSessionId}`);
+
+      await registry2.closeAllInstances();
+      store2.close();
+    } finally {
+      rmSync(dbDir, { recursive: true, force: true });
+      rmSync(wsDir, { recursive: true, force: true });
+    }
   });
 });
 
